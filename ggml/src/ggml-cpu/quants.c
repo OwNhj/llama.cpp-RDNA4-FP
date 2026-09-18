@@ -62,6 +62,10 @@ void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_nvfp4_ref(x, y, k);
 }
 
+void quantize_row_mxfp8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_mxfp8_ref(x, (block_mxfp8 *) y, k);
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
@@ -357,6 +361,40 @@ void ggml_vec_dot_nvfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
             }
 
             sumf += dy * d * (sumi_lo + sumi_hi);
+        }
+    }
+    *s = sumf;
+}
+
+// MXFP8: super-block of 256 elements = 8 sub-blocks of 32 = 8 q8_0 blocks
+void ggml_vec_dot_mxfp8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_MXFP8 == 0);
+    static_assert(QK_MXFP8_SUB == QK8_0, "QK_MXFP8_SUB and QK8_0 must be the same");
+
+    const block_mxfp8 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_MXFP8;
+
+    float sumf = 0;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        for (int s_idx = 0; s_idx < QK_MXFP8 / QK_MXFP8_SUB; ++s_idx) {
+            const float d = GGML_E8M0_TO_FP32(x[ib].e[s_idx]) * (1.0f / 512.0f) * GGML_CPU_FP16_TO_FP32(y[ib * (QK_MXFP8 / QK8_0) + s_idx].d);
+            const uint8_t * qx = x[ib].qs[s_idx];
+            const int8_t  * qy = y[ib * (QK_MXFP8 / QK8_0) + s_idx].qs;
+
+            int sumi = 0;
+            for (int j = 0; j < QK_MXFP8_SUB; ++j) {
+                const int sign = (qx[j] & 0x80) ? -1 : 1;
+                sumi += qy[j] * (sign * (int) kvalues_mxfp8[qx[j] & 0x7F]);
+            }
+            sumf += d * sumi;
         }
     }
     *s = sumf;

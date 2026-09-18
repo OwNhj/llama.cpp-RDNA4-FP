@@ -764,6 +764,88 @@ class NVFP4(__Quant, qtype=GGMLQuantizationType.NVFP4):
         return (d * vals.astype(np.float32)).reshape(n_super, 64)
 
 
+class MXFP8(__Quant, qtype=GGMLQuantizationType.MXFP8):
+    # E4M3FN (OCP) with one E8M0 scale per 32-element sub-block
+    # ref: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
+
+    @staticmethod
+    # same as ggml_e8m0_to_fp32 in ggml-impl.h
+    def e8m0_to_fp32(x: np.ndarray) -> np.ndarray:
+        bits = np.where(x == 0, np.uint32(0x00400000), np.uint32(x) << np.uint32(23))
+        return bits.view(np.float32)
+
+    @staticmethod
+    # E4M3FN (OCP) saturating round-to-nearest-even conversion,
+    # matches ggml_fp32_to_e4m3 in ggml-quants.c
+    def fp32_to_e4m3(v: np.ndarray) -> np.ndarray:
+        v = v.astype(np.float32)
+        s = np.where(v < 0, np.uint8(0x80), np.uint8(0x00))
+        a = np.abs(v)
+
+        # denormal region: a < 1/64, value = m * 2^-9, m in [0, 8); m == 8 carries into e == 1
+        dm = np.round(a * 512.0).astype(np.int32)
+        d_idx = np.where(dm >= 8, np.uint8(0x08), dm.astype(np.uint8))
+
+        # normal region: a = (1 + m/8) * 2^(e - 7)
+        f, E = np.frexp(a)
+        e = E + 6
+        frac = (2.0 * f - 1.0) * 8.0
+        m = np.round(frac).astype(np.int32)  # round to nearest, ties to even
+        carry = m >= 8
+        m = np.where(carry, 0, m)
+        e = np.where(carry, e + 1, e)
+        n_idx = (e.astype(np.uint8) << 3) | m.astype(np.uint8)
+        n_idx = np.where((a >= 448.0) | (e > 15), np.uint8(0x7E), n_idx)
+
+        idx = np.where(a < (1.0 / 64.0), d_idx, n_idx)
+        idx = np.where((a == 0) | ~np.isfinite(v), np.uint8(0), idx)
+
+        return s | idx
+
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        blocks = blocks.reshape(n_blocks, 8, cls.block_size // 8)
+
+        amax = abs(blocks).max(axis=-1, keepdims=True)
+
+        # E8M0: smallest power of 2 such that amax / 2^p <= 448 (max E4M3FN)
+        # with amax = f * 2^E (f in [0.5, 1)): p = E - 9 if f <= 7/8 else E - 8
+        f, E = np.frexp(amax)
+        p = np.where(f <= 7.0 / 8.0, E - 9, E - 8)
+        e = np.where(amax > 0, (p + 127).astype(np.uint8), np.uint8(0))
+
+        d_inv = 1.0 / cls.e8m0_to_fp32(e)
+        qs = cls.fp32_to_e4m3(blocks * d_inv)
+
+        return np.concatenate([qs.reshape(n_blocks, -1), e.reshape(n_blocks, -1)], axis=-1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        qs, e = np.hsplit(blocks, [cls.block_size])
+
+        scale = cls.e8m0_to_fp32(e.reshape(n_blocks, 8, 1))
+
+        q = qs.reshape(n_blocks, 8, 32)
+        sign = np.where(q & np.uint8(0x80), np.float32(-1.0), np.float32(1.0))
+        x = (q & np.uint8(0x7F)).astype(np.int32)
+        exp = (x >> 3) & 0xF
+        man = x & 0x7
+        mag = np.where(
+            x == 0, np.float32(0.0),
+            np.where(
+                x == 0x7F, np.float32(0.0),  # NaN -> 0
+                np.where(
+                    exp == 0,
+                    man.astype(np.float32) * np.float32(2.0 ** -9),
+                    (np.float32(1.0) + man.astype(np.float32) / 8.0) * (2.0 ** (exp - 7)).astype(np.float32))))
+
+        return (scale * mag * sign).reshape(n_blocks, cls.block_size)
+
+
 class IQ2_XXS(__Quant, qtype=GGMLQuantizationType.IQ2_XXS):
     ksigns: bytes = (
         b"\x00\x81\x82\x03\x84\x05\x06\x87\x88\x09\x0a\x8b\x0c\x8d\x8e\x0f"

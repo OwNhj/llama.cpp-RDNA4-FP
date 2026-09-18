@@ -112,6 +112,9 @@ typedef sycl::half2 ggml_half2;
 #define QI_NVFP4 (QK_NVFP4 / (4 * QR_NVFP4))
 #define QR_NVFP4 2
 
+#define QI_MXFP8 (QK_MXFP8 / (4 * QR_MXFP8))
+#define QR_MXFP8 4
+
 #define QI5_0 (QK5_0 / (4 * QR5_0))
 #define QR5_0 2
 
@@ -225,6 +228,15 @@ typedef struct {
     uint8_t qs[QK_NVFP4/2];           // packed 4-bit E2M1 values (32 bytes)
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + QK_NVFP4/2, "wrong nvfp4 block size/padding");
+
+// MXFP8 (OCP MX block-scaled FP8): E4M3 quants with one E8M0 scale per 32-element sub-block
+#define QK_MXFP8 256
+#define QK_MXFP8_SUB 32
+typedef struct {
+    uint8_t qs[QK_MXFP8 / QK_MXFP8_SUB][QK_MXFP8_SUB]; // E4M3 quants (256 bytes)
+    uint8_t e[QK_MXFP8 / QK_MXFP8_SUB];                 // E8M0 scales (8 bytes)
+} block_mxfp8;
+static_assert(sizeof(block_mxfp8) == QK_MXFP8 + sizeof(uint8_t)*(QK_MXFP8/QK_MXFP8_SUB), "wrong mxfp8 block size/padding");
 
 #define QK5_0 32
 typedef struct {
@@ -1127,6 +1139,29 @@ GGML_TABLE_BEGIN(int8_t, kvalues_fp4, 16)
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 GGML_TABLE_END()
 #define kvalues_mxfp4 kvalues_fp4
+
+#if defined(GGML_COMMON_IMPL_C)
+// E4M3 values (without sign, index = e4m3 bits & 0x7F) scaled by 512 for fixed-point accumulation
+// dequant: value = sign * GGML_E8M0_TO_FP32(e) * (1/512) * kvalues_mxfp8[qs & 0x7F]
+GGML_TABLE_BEGIN(int32_t, kvalues_mxfp8, 128)
+    0, 1, 2, 3, 4, 5, 6, 7,
+    8, 9, 10, 11, 12, 13, 14, 15,
+    16, 18, 20, 22, 24, 26, 28, 30,
+    32, 36, 40, 44, 48, 52, 56, 60,
+    64, 72, 80, 88, 96, 104, 112, 120,
+    128, 144, 160, 176, 192, 208, 224, 240,
+    256, 288, 320, 352, 384, 416, 448, 480,
+    512, 576, 640, 704, 768, 832, 896, 960,
+    1024, 1152, 1280, 1408, 1536, 1664, 1792, 1920,
+    2048, 2304, 2560, 2816, 3072, 3328, 3584, 3840,
+    4096, 4608, 5120, 5632, 6144, 6656, 7168, 7680,
+    8192, 9216, 10240, 11264, 12288, 13312, 14336, 15360,
+    16384, 18432, 20480, 22528, 24576, 26624, 28672, 30720,
+    32768, 36864, 40960, 45056, 49152, 53248, 57344, 61440,
+    65536, 73728, 81920, 90112, 98304, 106496, 114688, 122880,
+    131072, 147456, 163840, 180224, 196608, 212992, 229376, 0,
+GGML_TABLE_END()
+#endif // GGML_COMMON_IMPL_C
 
 #define NGRID_IQ1S 2048
 #define IQ1S_DELTA 0.125f
