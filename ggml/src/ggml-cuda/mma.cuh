@@ -1396,6 +1396,25 @@ namespace ggml_cuda_mma {
 #endif // AMD_MFMA_AVAILABLE
     }
 
+    // fp8 WMMA (RDNA4 / gfx12 only): A and B hold raw E4M3 bytes as ints (4 fp8 per int),
+    // D accumulates in float. Two 16x16x16 calls cover the 32-wide k tile.
+    template <data_layout dl_d, data_layout dl_ab>
+    static __device__ __forceinline__ void mma(
+            tile<16, 16, float, dl_d> & D, const tile<16, 8, int, dl_ab> & A, const tile<16, 8, int, dl_ab> & B) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+        using floatx8_t = __attribute__((ext_vector_type(8))) float;
+        using int32x2_t = __attribute__((ext_vector_type(2))) int;
+        floatx8_t *     acc   = (floatx8_t *)     D.x;
+        const int32x2_t * a_vec = (const int32x2_t *) A.x;
+        const int32x2_t * b_vec = (const int32x2_t *) B.x;
+        acc[0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a_vec[0], b_vec[0], acc[0]);
+        acc[0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a_vec[1], b_vec[1], acc[0]);
+#else
+        GGML_UNUSED_VARS(D, A, B);
+        NO_DEVICE_CODE;
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+    }
+
     static __device__ __forceinline__ void mma(
             tile<32, 32, int> & D, const tile<32, 4, int> & A, const tile<32, 4, int> & B) {
 #if defined(AMD_MFMA_AVAILABLE)

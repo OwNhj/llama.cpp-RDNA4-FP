@@ -844,6 +844,12 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 ggml_cuda_mmq_load_tiles_nvfp4<type, J, fallback>,
                 ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
+        case GGML_TYPE_MXFP8:
+            return ggml_cuda_mmq_util_funcs(
+                -1,
+                ggml_cuda_mmq_load_tiles_mxfp8<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_mxfp8_mma<type, J, fallback>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback>);
         default:
             return ggml_cuda_mmq_util_funcs(1, nullptr, nullptr, nullptr);
     }
@@ -1596,6 +1602,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
 // -----------------------------------------
 extern DECL_MMQ_CASE(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
+extern DECL_MMQ_CASE(GGML_TYPE_MXFP8);
 
 // -------------------------------------------------------------------------------------------------------------------------
 

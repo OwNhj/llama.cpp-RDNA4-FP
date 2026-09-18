@@ -1628,6 +1628,62 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// MXFP8 (RDNA4 / gfx12): raw E4M3 copy + E8M0 scales as float.
+// SRAM tile row: 256 fp8 (64 ints) + 8 float + 4 int pad == GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0 stride.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_mxfp8(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
+
+    // quants: one block_mxfp8 (256 fp8) per tile row; 16B per thread
+    constexpr int threads_per_row = 32;
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_mxfp8 * bxi = (const block_mxfp8 *) x + kbx0 + i*stride;
+
+        // 256 B quants / 32 threads = 8 B each. block_mxfp8 is 264 B (264 % 16 != 0),
+        // so odd x-blocks are only 8B-aligned -> int2 copy
+        ggml_cuda_memcpy_1<8>(x_qs + i*sram_stride + 2*txi, (const int *) bxi->qs + 2*txi);
+    }
+
+    // e8m0 scales: 8 per tile row
+    constexpr int blocks_per_tile_x_row = 8;
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_mxfp8 * bxi = (const block_mxfp8 *) x + kbx0 + i*stride;
+
+        x_df[i*sram_stride + kbxd] = ggml_cuda_e8m0_to_fp32(bxi->e[kbxd]);
+    }
+#else
+    GGML_UNUSED_VARS(x, x_tile, kbx0, i_max, stride);
+    NO_DEVICE_CODE;
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+}
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_mxfp4_fp4(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();

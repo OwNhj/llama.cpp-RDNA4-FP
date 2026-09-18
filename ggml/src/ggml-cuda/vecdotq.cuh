@@ -360,6 +360,83 @@ static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
 
     return sum;
 }
+
+#define VDR_MXFP8_Q8_1_MMVQ 2
+#define VDR_MXFP8_Q8_1_MMQ  1
+
+using ggml_cuda_vfloat2 = __attribute__((ext_vector_type(2))) float;
+
+#if defined(GGML_USE_HIP) && defined(RDNA4)
+// hardware: 2 packed E4M3 (bytes 0,1 of v) -> vfloat2 (gfx12; gfx1250 has the faster v_cvt_f16_fp8)
+static __device__ __forceinline__ ggml_cuda_vfloat2 ggml_cuda_cvt_e4m3x2(uint32_t v) {
+    return __builtin_amdgcn_cvt_pk_f32_fp8(v, false);
+}
+#else
+// portable E4M3 (OCP) decode; e == 15, m == 7 is NaN -> 0
+static __device__ __forceinline__ float ggml_cuda_e4m3_to_float(uint32_t b) {
+    const uint32_t s = b & 0x80;
+    const uint32_t e = (b >> 3) & 0xF;
+    uint32_t m = b & 0x7;
+
+    uint32_t bits;
+    if (e == 0) {
+        if (m == 0) {
+            return 0.0f;
+        }
+        // denormal: m * 2^-9
+        uint32_t a = 0;
+        while ((m & 1) == 0) {
+            m >>= 1;
+            a++;
+        }
+        bits = (s << 24) | ((118 + a) << 23) | ((m - 1) << (23 - a));
+    } else if (e == 15 && m == 7) {
+        return 0.0f; // NaN
+    } else {
+        // normal: (1 + m/8) * 2^(e-7)
+        bits = (s << 24) | ((120 + e) << 23) | (m << 20);
+    }
+
+    float result;
+    memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
+static __device__ __forceinline__ ggml_cuda_vfloat2 ggml_cuda_cvt_e4m3x2(uint32_t v) {
+    return ggml_cuda_vfloat2{ggml_cuda_e4m3_to_float(v & 0xFF), ggml_cuda_e4m3_to_float((v >> 8) & 0xFF)};
+}
+#endif // defined(GGML_USE_HIP) && defined(RDNA4)
+
+// x block_mxfp8 (QK=256, 8 e8m0 scales of 32) vs y block_q8_1 (QK=32).
+// one x block spans 8 y blocks; each thread (vdr ints = 8 x elements) stays inside a
+// single 32-element sub-block, so a single e8m0 scale applies to the whole thread chunk.
+static __device__ __forceinline__ float vec_dot_mxfp8_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_mxfp8 * bx = (const block_mxfp8 *) vbq + kbx;
+    const block_q8_1 * by = bq8_1 + iqs / 8;
+
+    const int * qx = (const int *) bx->qs + iqs;
+    const int * qy = (const int *) by->qs + (iqs % 8);
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int l = 0; l < VDR_MXFP8_Q8_1_MMVQ; ++l) {
+        const ggml_cuda_vfloat2 x01 = ggml_cuda_cvt_e4m3x2(qx[l]);
+        const ggml_cuda_vfloat2 x23 = ggml_cuda_cvt_e4m3x2(qx[l] >> 16);
+
+        sum += x01[0] * (float) (int8_t) (qy[l] & 0xFF);
+        sum += x01[1] * (float) (int8_t) ((qy[l] >> 8) & 0xFF);
+        sum += x23[0] * (float) (int8_t) ((qy[l] >> 16) & 0xFF);
+        sum += x23[1] * (float) (int8_t) ((qy[l] >> 24) & 0xFF);
+    }
+
+    const float dx = ggml_cuda_e8m0_to_fp32(bx->e[iqs / 8]);
+    const float dy = __low2float(by->ds);
+
+    return dx * dy * sum;
+}
+
 #define VDR_Q2_K_Q8_1_MMVQ 1
 #define VDR_Q2_K_Q8_1_MMQ  4
 

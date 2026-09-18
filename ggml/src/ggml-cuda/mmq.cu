@@ -76,6 +76,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_NVFP4:
             mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, args, stream);
             break;
+        case GGML_TYPE_MXFP8:
+            mul_mat_q_case<GGML_TYPE_MXFP8>(ctx, args, stream);
+            break;
         default:
             GGML_ABORT("fatal error");
             break;
@@ -152,6 +155,9 @@ void ggml_cuda_mul_mat_q(
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
+            } else if (src0->type == GGML_TYPE_MXFP8) {
+                quantize_mmq_mxfp8_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                                       ne11, ne12, ne13, stream);
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
@@ -229,6 +235,14 @@ void ggml_cuda_mul_mat_q(
                 quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
                                         ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
             }
+        } else if (src0->type == GGML_TYPE_MXFP8) {
+            if (dedup_bcast) {
+                quantize_scatter_mmq_mxfp8_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
+                                        /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
+            } else {
+                quantize_mmq_mxfp8_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+                                       ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
+            }
         } else if (dedup_bcast) {
             quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
                                     /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
@@ -296,11 +310,17 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 // -------------------------------------------------
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
+        case GGML_TYPE_MXFP8:
             mmq_supported = true;
             break;
         default:
             mmq_supported = false;
             break;
+    }
+
+    // The MXFP8 W8A8 fp8 WMMA path is implemented for RDNA4 only.
+    if (type == GGML_TYPE_MXFP8 && !GGML_CUDA_CC_IS_RDNA4(cc)) {
+        return false;
     }
 
     if (!mmq_supported) {

@@ -632,6 +632,162 @@ void quantize_scatter_mmq_q8_1_cuda(
     }
 }
 
+// E4M3 (OCP) encode with RNE, saturation to +/-448; NaN/Inf -> 0 (mirrors ggml_fp32_to_e4m3)
+static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_e4m3(float v) {
+    const uint32_t bits = __float_as_uint(v);
+    if (bits == 0u || (bits & 0x7F800000u) >= 0x7F800000u) {
+        return 0; // zero, or NaN/Inf
+    }
+
+    const uint8_t s = v < 0.0f ? 0x80u : 0x00u;
+    v = fabsf(v);
+
+    if (v >= 448.0f) {
+        return s | 0x7Eu; // saturate to max finite
+    }
+
+    if (v < (1.0f / 64.0f)) {
+        // denormal region: value = m * 2^-9, m in [0, 8); m == 8 carries into e == 1
+        const float t = v * 512.0f + 0.5f;
+        uint32_t m = (uint32_t) t;
+        if (t == (float) m && (m & 1u)) {
+            m--; // round ties to even
+        }
+        if (m >= 8u) {
+            return s | 0x08u;
+        }
+        return s | (uint8_t) m;
+    }
+
+    // normal region: v = (1 + m/8) * 2^(e - 7)
+    int E;
+    const float f = frexpf(v, &E); // v = f * 2^E, f in [0.5, 1)
+    int e = E + 6;
+    const float frac = (2.0f * f - 1.0f) * 8.0f; // in [0, 8)
+    const float t = frac + 0.5f;
+    uint32_t m = (uint32_t) t;
+    if (t == (float) m && (m & 1u)) {
+        m--; // round ties to even
+    }
+    if (m >= 8u) {
+        m = 0;
+        e++;
+    }
+    if (e > 15) {
+        return s | 0x7Eu;
+    }
+    return s | (uint8_t) (e << 3) | (uint8_t) m;
+}
+
+template <bool scatter>
+static __global__ void quantize_mmq_mxfp8(
+        const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int ne1, const int ne2, const int n_expert_used) {
+
+    const int64_t i0 = ((int64_t)blockDim.x*blockIdx.y + threadIdx.x)*4;
+
+    if (i0 >= ne0) {
+        return;
+    }
+
+    const int64_t i00 = i0;
+    ggml_cuda_pdl_sync();
+
+    int64_t base_idx;
+    if constexpr (scatter) {
+        base_idx = (int64_t) blockIdx.x * s02; // one physical row per token
+    } else {
+        const int64_t i2  = blockIdx.z % ne2;
+        const int64_t i3  = blockIdx.z / ne2;
+        const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
+        base_idx = i3*s03 + i2*s02 + i01*s01;
+    }
+
+    const float4 * x4 = (const float4 *) x;
+    block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
+
+    const int64_t k_block = i0 / QK8_1_MMQ; // column block in the channel
+    const int64_t iqs     = i0 % QK8_1_MMQ; // quant index in block
+
+    // Load 4 floats per thread and calculate max. abs. value between them:
+    const float4 xi = i0 < ne00 ? x4[(base_idx + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float amax = fabsf(xi.x);
+    amax = fmaxf(amax, fabsf(xi.y));
+    amax = fmaxf(amax, fabsf(xi.z));
+    amax = fmaxf(amax, fabsf(xi.w));
+
+    // Exchange max. abs. value between 8 threads (32 values per scale).
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+    }
+
+    const float d_inv = 448.0f / amax;
+    char4 q;
+    q.x = ggml_cuda_fp32_to_e4m3(xi.x*d_inv);
+    q.y = ggml_cuda_fp32_to_e4m3(xi.y*d_inv);
+    q.z = ggml_cuda_fp32_to_e4m3(xi.z*d_inv);
+    q.w = ggml_cuda_fp32_to_e4m3(xi.w*d_inv);
+    const float d = 1.0f / d_inv;
+
+    // write the block once (normal) or to each of the token's compact rows (scatter)
+    const int nwrite = scatter ? n_expert_used : 1;
+#pragma unroll
+    for (int slot = 0; slot < nwrite; ++slot) {
+        int64_t ib;
+        if constexpr (scatter) {
+            const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            ib = k_block*ne1 + i;
+        } else {
+            // first y-block of this channel slice (X*Y*B/QK8_1 == ne1*ne0/QK8_1_MMQ: 128-value blocks)
+            const int64_t ib0 = blockIdx.z*((int64_t)gridDim.x*gridDim.y*blockDim.x/QK8_1);
+            ib = ib0 + k_block*ne1 + blockIdx.x;
+        }
+
+        // Write back 4 E4M3 values as a single 32 bit value for better memory bandwidth:
+        char4 * yqs4 = (char4 *) y[ib].qs;
+        yqs4[iqs/4] = q;
+
+        if (iqs % 32 == 0) {
+            y[ib].d4[iqs/32] = d;
+        }
+    }
+    GGML_UNUSED(n_expert_used);
+}
+
+void quantize_mmq_mxfp8_cuda(
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    GGML_ASSERT(type_src0 == GGML_TYPE_MXFP8);
+    GGML_ASSERT(ne00 % 4 == 0);
+    GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
+
+    // ne1 tends to assume the highest values, therefore use it as the "x" dimension of the CUDA grid:
+    const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    quantize_mmq_mxfp8<false>
+        <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+}
+
+// scatter=true reuses the quant kernel: grid over tokens, ids = inverse map (token slot -> compact row)
+void quantize_scatter_mmq_mxfp8_cuda(
+        const float * x, const int32_t * ids_src1_inv, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t stride_token, const int64_t ne0,
+        const int64_t n_tokens, const int64_t nrows_dst, const int n_expert_used, cudaStream_t stream) {
+    GGML_ASSERT(type_src0 == GGML_TYPE_MXFP8);
+    GGML_ASSERT(ne00 % 4 == 0);
+    GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
+
+    const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 num_blocks(n_tokens, block_num_y, 1);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    quantize_mmq_mxfp8<true><<<num_blocks, block_size, 0, stream>>>(
+        x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
+}
+
 // scatter=true reuses the quant kernels: grid over tokens, ids = inverse map (token slot -> compact row)
 void quantize_scatter_mmq_fp4_cuda(
         const float * x, const int32_t * ids_src1_inv, void * vy, float * scale, const ggml_type type_src0, const bool use_aligned_float8,
