@@ -153,6 +153,25 @@ static __device__ void quantize_f32_q8_0_block(const float * __restrict__ x, blo
     }
 }
 
+static __device__ void quantize_f32_f8_block(const float * __restrict__ x, block_f8 * __restrict__ y) {
+    float amax = 0.0f; // absolute max
+
+    for (int j = 0; j < QK_F8; j++) {
+        const float v = x[j];
+        amax = fmaxf(amax, fabsf(v));
+    }
+
+    // map amax -> 448 (max finite E4M3FN), so the full e4m3 range is used
+    const float d = amax / 448.0f;
+    const float id = d ? 1.0f/d : 0.0f;
+
+    y->d = d;
+
+    for (int j = 0; j < QK_F8; ++j) {
+        y->qs[j] = ggml_cuda_fp32_to_e4m3(x[j]*id);
+    }
+}
+
 static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, block_iq4_nl * __restrict__ y) {
     float amax = 0.0f;
     float vmax = 0.0f;

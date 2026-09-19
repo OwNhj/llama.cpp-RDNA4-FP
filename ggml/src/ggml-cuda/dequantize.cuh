@@ -119,6 +119,20 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.y *= d;
 }
 
+// F8: E4M3 quants + F16 scale per 32-element group (KV-cache only).
+// e4m3 value = sign * ue4m3_raw(magnitude);  full value = e4m3 * d.
+static __device__ __forceinline__ void dequantize_f8(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_f8 * x = (const block_f8 *) vx;
+
+    const float d = x[ib].d;
+
+    v.x = (x[ib].qs[iqs + 0] & 0x80 ? -1.0f : 1.0f) * ggml_cuda_ue4m3_to_fp32_raw(x[ib].qs[iqs + 0] & 0x7F);
+    v.y = (x[ib].qs[iqs + 1] & 0x80 ? -1.0f : 1.0f) * ggml_cuda_ue4m3_to_fp32_raw(x[ib].qs[iqs + 1] & 0x7F);
+
+    v.x *= d;
+    v.y *= d;
+}
+
 //================================== k-quants
 
 // Each call dequantizes one super-block of QK_K values into y using the

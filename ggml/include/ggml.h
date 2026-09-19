@@ -431,7 +431,8 @@ extern "C" {
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_MXFP8   = 43, // MXFP8 (OCP MX block-scaled FP8 E4M3, 8.25 bpw)
-        GGML_TYPE_COUNT   = 44,
+        GGML_TYPE_F8      = 44, // F8 (E4M3 quants + F16 scale per 32 elems, KV-cache only, 8.5 bpw)
+        GGML_TYPE_COUNT   = 45,
     };
 
     // [TAG_GGML_PREC]

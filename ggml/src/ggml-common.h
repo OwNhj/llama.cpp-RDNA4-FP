@@ -115,6 +115,9 @@ typedef sycl::half2 ggml_half2;
 #define QI_MXFP8 (QK_MXFP8 / (4 * QR_MXFP8))
 #define QR_MXFP8 1
 
+#define QI_F8 (QK_F8 / (4 * QR_F8))
+#define QR_F8 1
+
 #define QI5_0 (QK5_0 / (4 * QR5_0))
 #define QR5_0 2
 
@@ -237,6 +240,15 @@ typedef struct {
     uint8_t e[QK_MXFP8 / QK_MXFP8_SUB];                 // E8M0 scales (8 bytes)
 } block_mxfp8;
 static_assert(sizeof(block_mxfp8) == QK_MXFP8 + sizeof(uint8_t)*(QK_MXFP8/QK_MXFP8_SUB), "wrong mxfp8 block size/padding");
+
+// F8: E4M3 quants with one F16 scale per 32-element group (Q8_0-shaped, KV-cache only).
+// 8.5 bpw; the 32-elem group matches the fp8 WMMA K=32 tile (one scale per mma group).
+#define QK_F8 32
+typedef struct {
+    ggml_half d;          // scale (f16)
+    uint8_t qs[QK_F8];    // 32 E4M3 quants
+} block_f8;
+static_assert(sizeof(block_f8) == sizeof(ggml_half) + QK_F8, "wrong f8 block size/padding");
 
 #define QK5_0 32
 typedef struct {

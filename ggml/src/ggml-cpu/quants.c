@@ -66,6 +66,10 @@ void quantize_row_mxfp8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_mxfp8_ref(x, (block_mxfp8 *) y, k);
 }
 
+void quantize_row_f8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_f8_ref(x, (block_f8 *) y, k);
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //

@@ -632,53 +632,6 @@ void quantize_scatter_mmq_q8_1_cuda(
     }
 }
 
-// E4M3 (OCP) encode with RNE, saturation to +/-448; NaN/Inf -> 0 (mirrors ggml_fp32_to_e4m3)
-static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_e4m3(float v) {
-    const uint32_t bits = __float_as_uint(v);
-    if (bits == 0u || (bits & 0x7F800000u) >= 0x7F800000u) {
-        return 0; // zero, or NaN/Inf
-    }
-
-    const uint8_t s = v < 0.0f ? 0x80u : 0x00u;
-    v = fabsf(v);
-
-    if (v >= 448.0f) {
-        return s | 0x7Eu; // saturate to max finite
-    }
-
-    if (v < (1.0f / 64.0f)) {
-        // denormal region: value = m * 2^-9, m in [0, 8); m == 8 carries into e == 1
-        const float t = v * 512.0f + 0.5f;
-        uint32_t m = (uint32_t) t;
-        if (t == (float) m && (m & 1u)) {
-            m--; // round ties to even
-        }
-        if (m >= 8u) {
-            return s | 0x08u;
-        }
-        return s | (uint8_t) m;
-    }
-
-    // normal region: v = (1 + m/8) * 2^(e - 7)
-    int E;
-    const float f = frexpf(v, &E); // v = f * 2^E, f in [0.5, 1)
-    int e = E + 6;
-    const float frac = (2.0f * f - 1.0f) * 8.0f; // in [0, 8)
-    const float t = frac + 0.5f;
-    uint32_t m = (uint32_t) t;
-    if (t == (float) m && (m & 1u)) {
-        m--; // round ties to even
-    }
-    if (m >= 8u) {
-        m = 0;
-        e++;
-    }
-    if (e > 15) {
-        return s | 0x7Eu;
-    }
-    return s | (uint8_t) (e << 3) | (uint8_t) m;
-}
-
 template <bool scatter>
 static __global__ void quantize_mmq_mxfp8(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,

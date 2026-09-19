@@ -942,6 +942,55 @@ static __device__ __forceinline__ uint8_t ggml_cuda_e2m1_to_e4m3(uint8_t c) {
     return (uint8_t) ((s ? mag | 0x80u : mag) & 0xFFu);
 }
 
+// E4M3FN (OCP) saturating round-to-nearest-even f32 -> e4m3 encoder.
+// Global (non-static) so the KV-cache quantize (set-rows / cpy-utils) and the
+// F8 flash-attention kernel can cast f16/f32 values to e4m3 without a dequant.
+__device__ __forceinline__ uint8_t ggml_cuda_fp32_to_e4m3(float v) {
+    const uint32_t bits = __float_as_uint(v);
+    if (bits == 0u || (bits & 0x7F800000u) >= 0x7F800000u) {
+        return 0; // zero, or NaN/Inf
+    }
+
+    const uint8_t s = v < 0.0f ? 0x80u : 0x00u;
+    v = fabsf(v);
+
+    if (v >= 448.0f) {
+        return s | 0x7Eu; // saturate to max finite
+    }
+
+    if (v < (1.0f / 64.0f)) {
+        // denormal region: value = m * 2^-9, m in [0, 8); m == 8 carries into e == 1
+        const float t = v * 512.0f + 0.5f;
+        uint32_t m = (uint32_t) t;
+        if (t == (float) m && (m & 1u)) {
+            m--; // round ties to even
+        }
+        if (m >= 8u) {
+            return s | 0x08u;
+        }
+        return s | (uint8_t) m;
+    }
+
+    // normal region: v = (1 + m/8) * 2^(e - 7)
+    int E;
+    const float f = frexpf(v, &E); // v = f * 2^E, f in [0.5, 1)
+    int e = E + 6;
+    const float frac = (2.0f * f - 1.0f) * 8.0f; // in [0, 8)
+    const float t = frac + 0.5f;
+    uint32_t m = (uint32_t) t;
+    if (t == (float) m && (m & 1u)) {
+        m--; // round ties to even
+    }
+    if (m >= 8u) {
+        m = 0;
+        e++;
+    }
+    if (e > 15) {
+        return s | 0x7Eu;
+    }
+    return s | (uint8_t) (e << 3) | (uint8_t) m;
+}
+
 __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e) {
     const uint8_t sign_bit = (x < 0.0f) << 3;
     float         ax       = fabsf(x) * e;
@@ -1114,6 +1163,14 @@ struct ggml_cuda_type_traits<GGML_TYPE_MXFP8> {
     static constexpr int qr = QR_MXFP8;
     static constexpr int qi = QI_MXFP8;
     static constexpr int bs = sizeof(block_mxfp8);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_F8> {
+    static constexpr int qk = QK_F8;
+    static constexpr int qr = QR_F8;
+    static constexpr int qi = QI_F8;
+    static constexpr int bs = sizeof(block_f8);
 };
 
 template<>
