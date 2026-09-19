@@ -832,23 +832,25 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
 // ---------------------------------------------------------------------------------------------
+        // W8A8 fp8 WMMA on RDNA4: e2m1 weights expanded to e4m3 at tile load (exact).
+        // On other archs the fp8 loaders/vec_dots delegate back to these int8 mainline paths.
         case GGML_TYPE_MXFP4:
             return ggml_cuda_mmq_util_funcs(
                 -1,
-                ggml_cuda_mmq_load_tiles_mxfp4<type, J, fallback>,
-                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
+                ggml_cuda_mmq_load_tiles_mxfp4_fp8<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_fp8_mma<type, J, fallback, /*x_scale_ints=*/8>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
         case GGML_TYPE_NVFP4:
             return ggml_cuda_mmq_util_funcs(
                 -1,
-                ggml_cuda_mmq_load_tiles_nvfp4<type, J, fallback>,
-                ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback>,
+                ggml_cuda_mmq_load_tiles_nvfp4_fp8<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_fp8_mma<type, J, fallback, /*x_scale_ints=*/4, /*x_tile_ints=*/4>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
         case GGML_TYPE_MXFP8:
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_mxfp8<type, J, fallback>,
-                ggml_cuda_mmq_vec_dot_mxfp8_mma<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_fp8_mma<type, J, fallback, /*x_scale_ints=*/8>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
         default:
             return ggml_cuda_mmq_util_funcs(1, nullptr, nullptr, nullptr);

@@ -894,6 +894,54 @@ static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 }
 
+// Raw UE4M3 -> f32, WITHOUT the /2 baked into ggml_cuda_ue4m3_to_fp32 (that /2 compensates the
+// 2x-doubled e2m1 int8 lookup table used by the dp4a / int8-WMMA paths). The fp8 WMMA paths
+// store exact e2m1 values as e4m3, so the scale must be applied raw.
+static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32_raw(uint8_t x) {
+#if defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
+    const uint32_t bits = x * (x != 0x7F && x != 0xFF); // Convert NaN to 0.0f to match CPU implementation.
+    const __hip_fp8_e4m3_fnuz xf = *reinterpret_cast<const __hip_fp8_e4m3_fnuz *>(&bits);
+    return static_cast<float>(xf);
+#else
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+    const uint32_t bits = x * (x != 0x7F && x != 0xFF); // Convert NaN to 0.0f to match CPU implementation.
+    const __nv_fp8_e4m3 xf = *reinterpret_cast<const __nv_fp8_e4m3 *>(&bits);
+    return static_cast<float>(xf);
+#else
+    if (x == 0 || (x == 0x7F && x != 0xFF)) { // Convert NaN to 0.0f
+        return 0.0f;
+    }
+    const int exp = (x >> 3) & 0xF;
+    const int man = x & 0x7;
+    if (exp == 0) {
+        return ldexpf((float) man, -9);
+    }
+    return ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+#endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+#endif // defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
+}
+
+// Exact e2m1 (OCP FP4, 4-bit) -> e4m3 (FP8, 8-bit) expansion.
+// The 8 e2m1 magnitudes {0, 0.5, 1, 1.5, 2, 3, 4, 6} are all exactly representable in e4m3
+// (mantissas 1.0 / 1.5, wide enough exponent range), so MXFP4 / NVFP4 weights can be fed to the
+// W8A8 fp8 WMMA path with zero extra loss. `c` is the 4-bit e2m1 code (sign | e<<1 | m).
+// NOTE: CPU dequant pairs kvalues_fp4 (2x e2m1) with a half scale (ggml_e8m0_to_fp32_half /
+// ggml_ue4m3_to_fp32 = value*0.5) so the net value is the standard e2m1 * scale; emitting raw
+// e2m1 here (raw scale on the GPU) is consistent with that.
+static __device__ __forceinline__ uint8_t ggml_cuda_e2m1_to_e4m3(uint8_t c) {
+    const uint32_t s = (c >> 3) & 1;
+    const uint32_t e = (c >> 1) & 3;
+    const uint32_t m = c & 1;
+    // magnitude: e=0 -> {0, 0.5}; e>=1 -> (1 + m/2) * 2^(e-1)
+    uint32_t mag;
+    if (e == 0) {
+        mag = m ? 0x30u /* 0.5 */ : 0x00u /* 0   */;
+    } else {
+        mag = ((e + 6) << 3) | (m << 2); // E = e-1+7 = e+6, mantissa 1.0 (m=0) or 1.5 (m=1)
+    }
+    return (uint8_t) ((s ? mag | 0x80u : mag) & 0xFFu);
+}
+
 __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e) {
     const uint8_t sign_bit = (x < 0.0f) << 3;
     float         ax       = fabsf(x) * e;

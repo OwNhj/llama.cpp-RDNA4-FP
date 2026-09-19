@@ -277,16 +277,29 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 }
 
-// MXFP8 x vs fp8-quantized y: W8A8 fp8 WMMA (RDNA4 / gfx12 only).
-// x SRAM tile row: 256 raw E4M3 bytes (64 ints) + 8 E8M0 scales as float + 4 int pad (same stride as Q8_0 layout).
-// y SRAM tile row: 128 raw E4M3 bytes (32 ints) + 4 scales as float (same layout as block_q8_1_mmq D4).
-template <ggml_type type, int J, bool fallback>
-static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_mxfp8_mma(
+// W8A8 fp8 WMMA vec_dot (RDNA4 / gfx12): x tile = 256 raw E4M3 bytes (64 ints) + x-scales as float,
+// y tile = 128 raw E4M3 bytes (32 ints) + 4 scales as float (block_q8_1_mmq D4 layout, e4m3-quantized y).
+// Serves the e4m3-based types:
+//   - MXFP8 : x-scales = 8 E8M0 per 32 elems (stride 76, same as Q8_0 layout),  x_scale_ints = 8 (32 elems / 4 bytes per int)
+//   - MXFP4 : x-scales = 8 E8M0 per 32 elems (stride 76, same as Q8_1 layout),  x_scale_ints = 8 (32 elems / 4 bytes per int)
+//   - NVFP4 : x-scales = 16 UE4M3 per 16 elems (stride 84, generic NVFP4 layout), x_scale_ints = 4 (16 elems / 4 bytes per int)
+// NOTE: x_scale_ints is the divisor of k0 (in INT units) to index the per-scale row; the scale spacing is 4 bytes.
+// The MXFP4 / NVFP4 e2m1 weights are expanded to e4m3 at tile load (exact, e2m1 values are a subset
+// of e4m3), so the W8A8 fp8 product is lossless. On other archs the mainline int8 WMMA paths are kept.
+// Forward declaration (defined below; only needed for the non-RDNA4 NVFP4 fallback).
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
+
+template <ggml_type type, int J, bool fallback, int x_scale_ints, int x_tile_ints = 8>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_fp8_mma(
     const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
 #if defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+    // x_tile_ints = ints (4 e4m3 bytes each) per ldmatrix/mma k-tile. Must equal the scale
+    // spacing so that one dA covers the whole tile: 8 for MXFP4/MXFP8 (scale per 32 elems),
+    // 4 for NVFP4 (scale per 16 elems). fp8 WMMA is K=16 (4 ints); an 8-int tile issues 2.
     constexpr data_layout input_layout = get_input_data_layout();
-    typedef tile<16,  8, int, input_layout>         tile_A;
-    typedef tile<16,  8, int, input_layout>         tile_B;
+    typedef tile<16,  x_tile_ints, int, input_layout>         tile_A;
+    typedef tile<16,  x_tile_ints, int, input_layout>         tile_B;
     typedef tile<16, 16, float, DATA_LAYOUT_J_MAJOR> tile_C;
 
     constexpr int sram_stride   = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
@@ -302,7 +315,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_mxfp8_mma(
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
-    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += x_tile_ints) {
         const int k0 = k00 + k01;
 
         tile_A A[ntx];
@@ -326,15 +339,23 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_mxfp8_mma(
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
                     const int i = i0 + n*tile_A::I + tile_C::get_i(l);
-                    const float dA = x_df[i*sram_stride + k0/QI8_0];
+                    const float dA = x_df[i*sram_stride + k0/x_scale_ints];
                     sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA*dB;
                 }
             }
         }
     }
 #else
-    GGML_UNUSED_VARS(x, y, sum, k00);
-    NO_DEVICE_CODE;
+    // Non-RDNA4: keep the mainline int8 WMMA behavior (load_tiles_mxfp4_fp8 / _nvfp4_fp8
+    // fall back to the int8 loaders to match). MXFP8 is gated to RDNA4 in should_use_mmq.
+    if constexpr (type == GGML_TYPE_NVFP4) {
+        ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback>(x, y, sum, k00);
+    } else if constexpr (type == GGML_TYPE_MXFP4) {
+        ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>(x, y, sum, k00);
+    } else {
+        GGML_UNUSED_VARS(x, y, sum, k00);
+        NO_DEVICE_CODE;
+    }
 #endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
 }
 

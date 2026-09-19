@@ -760,7 +760,7 @@ void quantize_mmq_mxfp8_cuda(
         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
-    GGML_ASSERT(type_src0 == GGML_TYPE_MXFP8);
+    GGML_ASSERT(type_src0 == GGML_TYPE_MXFP8 || type_src0 == GGML_TYPE_MXFP4 || type_src0 == GGML_TYPE_NVFP4);
     GGML_ASSERT(ne00 % 4 == 0);
     GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
 
@@ -777,7 +777,7 @@ void quantize_scatter_mmq_mxfp8_cuda(
         const float * x, const int32_t * ids_src1_inv, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t stride_token, const int64_t ne0,
         const int64_t n_tokens, const int64_t nrows_dst, const int n_expert_used, cudaStream_t stream) {
-    GGML_ASSERT(type_src0 == GGML_TYPE_MXFP8);
+    GGML_ASSERT(type_src0 == GGML_TYPE_MXFP8 || type_src0 == GGML_TYPE_MXFP4 || type_src0 == GGML_TYPE_NVFP4);
     GGML_ASSERT(ne00 % 4 == 0);
     GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
 
