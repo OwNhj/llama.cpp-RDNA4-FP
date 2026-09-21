@@ -43,6 +43,18 @@ static __device__ __forceinline__ float e4m3_to_fp32_signed(uint8_t x) {
     return (x & 0x80 ? -1.0f : 1.0f) * ggml_cuda_ue4m3_to_fp32_raw(x & 0x7F);
 }
 
+// Two packed e4m3 bytes -> f32x2. ggml_cuda_e4m3x2_to_fp32() (common.cuh) is the shared
+// implementation: it uses the gfx12 hardware instruction and falls back to a portable software
+// decode elsewhere, and it follows the signed e4m3 convention the KV cache is written with.
+
+// Same as e4m3x2_to_fp32 but for 4 consecutive e4m3 bytes loaded as one 32-bit word, halving the
+// number of global loads in the V dequant.
+static __device__ __forceinline__ void e4m3x4_to_fp32(uint32_t w, float4 & out) {
+    const float2 lo = ggml_cuda_e4m3x2_to_fp32((uint8_t)( w        & 0xFF), (uint8_t)((w >>  8) & 0xFF));
+    const float2 hi = ggml_cuda_e4m3x2_to_fp32((uint8_t)((w >> 16) & 0xFF), (uint8_t)((w >> 24) & 0xFF));
+    out = make_float4(lo.x, lo.y, hi.x, hi.y);
+}
+
 template <int DKQ, int DV, bool use_logit_softcap>
 static __global__ void flash_attn_ext_f8(
         const char * Q_ptr,
@@ -76,7 +88,7 @@ static __global__ void flash_attn_ext_f8(
 
     constexpr int warp_size   = 32;
     constexpr int ncols1      = 16;   // query rows per block
-    constexpr int nbatch_fa   = 32;   // KV positions per iteration
+    constexpr int nbatch_fa   = 32;   // KV positions per iteration (multiple of 32 = the fp8 scale group)
     constexpr int n_kv_groups = DKQ/32;
     constexpr int n_out_tiles = DV/16;
 
@@ -123,18 +135,23 @@ static __global__ void flash_attn_ext_f8(
     // ------------------------------------------------------------------
     // SRAM layout
     //   sQ  : 16 x DKQ/4   int    (Q e4m3, head_dim-major per query row)
-    //   sK  : 32 x DKQ/4   int    (K e4m3, head_dim-major per seq)
-    //   sKd : 32 x n_kv_groups float (K scale, per (seq, head group))
-    //   sVf : DV x 16       half2  (V dequant f16, head_out-major, 2 seq per half2)
+    //   sK  : nbatch_fa x DKQ/4   int    (K e4m3, head_dim-major per seq)
+    //   sKd : nbatch_fa x n_kv_groups float (K scale, per (seq, head group))
+    //   sVf : DV x nbatch_fa/2 half2  (V dequant f16, head_out-major, 2 seq per half2)
     //   sScale : 16 float   (per-query-row softmax rescale factor, indexed by seq_q)
     //   sRowsum: 16 float   (per-query-row rowsum, indexed by seq_q)
     // ------------------------------------------------------------------
+    // K/V are double buffered so that the loads of the next KV tile can be issued while the current
+    // tile is still being consumed by the mma; without this the loads are fully serialized with the
+    // compute and the kernel is latency bound (it runs a single warp per block).
+    constexpr int n_kv_bufs = 2;
+
     extern __shared__ char sram[];
     int   * sQ     = (int   *) (sram + 0);
     int   * sK     = (int   *) (sQ     + 16*(DKQ/4));
-    float * sKd    = (float *) (sK     + 32*(DKQ/4));
-    half2 * sVf    = (half2 *) (sKd    + 32*n_kv_groups);
-    float * sScale = (float *) (sVf    + (size_t)DV*(nbatch_fa/2));
+    float * sKd    = (float *) (sK     + n_kv_bufs*nbatch_fa*(DKQ/4));
+    half2 * sVf    = (half2 *) (sKd    + n_kv_bufs*nbatch_fa*n_kv_groups);
+    float * sScale = (float *) (sVf    + (size_t)n_kv_bufs*DV*(nbatch_fa/2));
     float * sRowsum= (float *) (sScale + 16);
 
     // K/V base for this (z_KV, sequence)
@@ -148,7 +165,7 @@ static __global__ void flash_attn_ext_f8(
     // ------------------------------------------------------------------
     // registers
     // ------------------------------------------------------------------
-    T_A_KQ    Q_A[n_kv_groups];          // Q fragments (loaded once)
+    T_A_KQ    Q_A[n_kv_groups];          // Q fragments (loaded once, loop invariant)
     T_C_VKQ   VKQ_C[n_out_tiles];        // O accumulator
     float     KQ_max    = -FLT_MAX/2.0f;
     float     KQ_rowsum = 0.0f;
@@ -199,58 +216,108 @@ static __global__ void flash_attn_ext_f8(
     }
     if (n_iters < 0) n_iters = 0;
 
-    for (int it = 0; it < n_iters; ++it) {
-        const int k0 = it*nbatch_fa;   // first absolute key position of this chunk
+    // ---- KV tile loader, double buffered (buf 0/1) ----
+    // A seq's head_dim row is DKQ/32 groups of 32 contiguous e4m3 bytes (the 2-byte scale sits
+    // between groups, so the groups are not contiguous with each other); qs is only 2-byte aligned
+    // inside block_f8, hence memcpy_1<4> instead of a wide vector copy.
+    auto load_KV = [&](const int buf, const int k0) {
+        int   * sK_buf  = sK  + (size_t)buf*nbatch_fa*(DKQ/4);
+        float * sKd_buf = sKd + (size_t)buf*nbatch_fa*n_kv_groups;
+        half2 * sVf_buf = sVf + (size_t)buf*DV*(nbatch_fa/2);
 
-        // ---- load K e4m3 + kscale to sK/sKd ----
-        for (int idx = threadIdx.x; idx < nbatch_fa*(DKQ/4); idx += warp_size) {
-            const int s  = idx / (DKQ/4);       // seq (0..31)
-            const int ic = idx % (DKQ/4);       // int col (4 e4m3 each)
-            const int seq_k = k0 + s;
-            if (seq_k < n_pos_kv) {
-                // int col ic (0..DKQ/4-1) -> block g = ic/8 (DKQ/32 blocks), 4 e4m3 within block
-                const int g      = ic / 8;
-                const int e      = (ic % 8)*4;
-                const block_f8 * blk = K0 + seq_k*nb11_blk + g;
-                const uint8_t * qs = blk->qs;
-                sK[idx] = pack_e4m3_4(qs[e+0], qs[e+1], qs[e+2], qs[e+3]);
-            } else {
-                sK[idx] = 0;
+        {
+            constexpr int ints_per_group = 32/4;         // 8 int columns per block_f8 group
+            for (int s = threadIdx.x; s < nbatch_fa; s += warp_size) {
+                const int seq_k = k0 + s;
+                if (seq_k < n_pos_kv) {
+                    const block_f8 * kb = K0 + seq_k*nb11_blk;
+                    #pragma unroll
+                    for (int g = 0; g < n_kv_groups; ++g) {
+                        const uint8_t * src = kb[g].qs;
+                        #pragma unroll
+                        for (int e = 0; e < ints_per_group; ++e) {
+                            ggml_cuda_memcpy_1<4>(&sK_buf[s*(DKQ/4) + g*ints_per_group + e], src + 4*e);
+                        }
+                    }
+                } else {
+                    #pragma unroll
+                    for (int ic = 0; ic < DKQ/4; ++ic) {
+                        sK_buf[s*(DKQ/4) + ic] = 0;
+                    }
+                }
             }
         }
         for (int idx = threadIdx.x; idx < nbatch_fa*n_kv_groups; idx += warp_size) {
             const int s = idx / n_kv_groups;
             const int g = idx % n_kv_groups;
             const int seq_k = k0 + s;
-            sKd[idx] = (seq_k < n_pos_kv) ? __half2float(K0[seq_k*nb11_blk + g].d) : 0.0f;
+            sKd_buf[idx] = (seq_k < n_pos_kv) ? __half2float(K0[seq_k*nb11_blk + g].d) : 0.0f;
         }
+        // V: iterate over (vscale group, seq pair). One block_f8 group holds 32 consecutive
+        // head_out bytes plus a single scale, so each work item decodes a whole group and reads its
+        // scale once, instead of touching one byte per (head, seq pair) with the scale re-read 32x.
+        {
+            constexpr int n_grp  = DV/32;          // vscale groups per row
+            constexpr int n_seq2 = nbatch_fa/2;    // half2 columns (2 seq each)
+            for (int idx = threadIdx.x; idx < n_grp*n_seq2; idx += warp_size) {
+                const int g   = idx / n_seq2;
+                const int sh2 = idx - g*n_seq2;
+                const int s0  = k0 + 2*sh2;
+                const block_f8 * blk0 = V0 + s0*nb21_blk + g;
+                const block_f8 * blk1 = blk0 + nb21_blk;      // seq s0+1
+                const float d0 = (s0     < n_pos_kv) ? __half2float(blk0->d) : 0.0f;
+                const float d1 = (s0 + 1 < n_pos_kv) ? __half2float(blk1->d) : 0.0f;
+                // half2 = (seq s0, seq s0+1) for the same head_out, matching the ldmatrix row layout.
+                #pragma unroll
+                for (int hq4 = 0; hq4 < 8; ++hq4) {
+                    uint32_t w0, w1;
+                    ggml_cuda_memcpy_1<4>(&w0, blk0->qs + 4*hq4);
+                    ggml_cuda_memcpy_1<4>(&w1, blk1->qs + 4*hq4);
+                    float4 f0, f1;
+                    e4m3x4_to_fp32(w0, f0);
+                    e4m3x4_to_fp32(w1, f1);
+                    #pragma unroll
+                    for (int q = 0; q < 4; ++q) {
+                        const int hq = 4*hq4 + q;
+                        const float a = (q == 0) ? f0.x : (q == 1) ? f0.y : (q == 2) ? f0.z : f0.w;
+                        const float b = (q == 0) ? f1.x : (q == 1) ? f1.y : (q == 2) ? f1.z : f1.w;
+                        sVf_buf[(g*32 + hq)*(nbatch_fa/2) + sh2] = make_half2(a*d0, b*d1);
+                    }
+                }
+            }
+        }
+    };
 
-        // ---- load V e4m3 + vscale -> dequant to sVf (f16, head_out-major) ----
-        for (int idx = threadIdx.x; idx < DV*(nbatch_fa/2); idx += warp_size) {
-            const int h   = idx / (nbatch_fa/2);   // head_out (0..DV-1)
-            const int sh2 = idx % (nbatch_fa/2);   // half2 col (2 seq each)
-            const int s0  = k0 + 2*sh2;
-            const int s1  = k0 + 2*sh2 + 1;
-            const block_f8 * blk0 = V0 + s0*nb21_blk + (h/32);
-            const block_f8 * blk1 = V0 + s1*nb21_blk + (h/32);
-            const float d0 = __half2float(blk0->d);
-            const float d1 = __half2float(blk1->d);
-            const float f0 = (s0 < n_pos_kv) ? d0 * e4m3_to_fp32_signed(blk0->qs[h%32]) : 0.0f;
-            const float f1 = (s1 < n_pos_kv) ? d1 * e4m3_to_fp32_signed(blk1->qs[h%32]) : 0.0f;
-            sVf[idx] = make_half2(f0, f1);
+    // Software pipeline: issue the loads for tile it+1 before consuming tile it, so the global
+    // memory latency overlaps the mma / softmax work instead of serializing with it. One sync per
+    // tile is enough: after it, every thread has finished reading the buffer being refilled.
+    load_KV(0, 0);
+    __syncthreads();
+
+    for (int it = 0; it < n_iters; ++it) {
+        const int k0  = it*nbatch_fa;   // first absolute key position of this chunk
+        const int cur = it & 1;
+        const int nxt = cur ^ 1;
+
+        int   * sK_cur  = sK  + (size_t)cur*nbatch_fa*(DKQ/4);
+        float * sKd_cur = sKd + (size_t)cur*nbatch_fa*n_kv_groups;
+        half2 * sVf_cur = sVf + (size_t)cur*DV*(nbatch_fa/2);
+
+        if (it + 1 < n_iters) {
+            load_KV(nxt, (it + 1)*nbatch_fa);
         }
-        __syncthreads();
 
         // ---- KQ matmul: S (16 seq_q x 32 seq) = sum_g kscale[seq][g] * (Q_g . K_g^T) ----
-        T_C_KQ S[2];   // 2 seq halves (16 each)
+        constexpr int n_sh = nbatch_fa/16;   // 16-seq halves
+        T_C_KQ S[n_sh];
         #pragma unroll
-        for (int sh = 0; sh < 2; ++sh) {
+        for (int sh = 0; sh < n_sh; ++sh) {
             #pragma unroll
             for (int l = 0; l < T_C_KQ::ne; ++l) { S[sh].x[l] = 0.0f; }
             #pragma unroll
             for (int g = 0; g < n_kv_groups; ++g) {
                 T_B_KQ K_B;
-                load_ldmatrix(K_B, sK + sh*16*(DKQ/4) + g*8, DKQ/4);
+                load_ldmatrix(K_B, sK_cur + sh*16*(DKQ/4) + g*8, DKQ/4);
                 T_C_KQ tmp;
                 // mma convention: D = second x first^T  ->  D[m][n] = second[m]*first[n]
                 // want S[m=query][n=key] = Q[m]*K[n]  =>  first=K, second=Q
@@ -259,7 +326,7 @@ static __global__ void flash_attn_ext_f8(
                 #pragma unroll
                 for (int l = 0; l < T_C_KQ::ne; ++l) {
                     const int seq_k_idx = T_C_KQ::get_j(l);   // 0..15 within the 16-seq half
-                    const float d = sKd[(sh*16 + seq_k_idx)*n_kv_groups + g];
+                    const float d = sKd_cur[(sh*16 + seq_k_idx)*n_kv_groups + g];
                     S[sh].x[l] += d * tmp.x[l];
                 }
             }
@@ -271,7 +338,7 @@ static __global__ void flash_attn_ext_f8(
         // The mask (F16) encodes the causal/sparse pattern: mask[query=q][key=k] = mask_h[k + q*n_pos_kv].
         // Without a mask, use the standard causal: query q sees keys 0..(n_pos_kv - n_pos_q + q).
         #pragma unroll
-        for (int sh = 0; sh < 2; ++sh) {
+        for (int sh = 0; sh < n_sh; ++sh) {
             #pragma unroll
             for (int l = 0; l < T_C_KQ::ne; ++l) {
                 const int seq_q = q0 + T_C_KQ::get_i(l);
@@ -290,7 +357,7 @@ static __global__ void flash_attn_ext_f8(
         }
         if constexpr (use_logit_softcap) {
             #pragma unroll
-            for (int sh = 0; sh < 2; ++sh) {
+            for (int sh = 0; sh < n_sh; ++sh) {
                 #pragma unroll
                 for (int l = 0; l < T_C_KQ::ne; ++l) {
                     S[sh].x[l] = logit_softcap * tanhf(S[sh].x[l]);
@@ -302,7 +369,7 @@ static __global__ void flash_attn_ext_f8(
         float KQ_max_new = KQ_max;
         float KQ_rowsum_add = 0.0f;
         #pragma unroll
-        for (int sh = 0; sh < 2; ++sh) {
+        for (int sh = 0; sh < n_sh; ++sh) {
             #pragma unroll
             for (int l = 0; l < T_C_KQ::ne; ++l) {
                 KQ_max_new = fmaxf(KQ_max_new, S[sh].x[l] + FATTN_KQ_MAX_OFFSET);
@@ -311,7 +378,7 @@ static __global__ void flash_attn_ext_f8(
         KQ_max_new = fmaxf(KQ_max_new, __shfl_xor_sync(0xFFFFFFFF, KQ_max_new, 16, warp_size));
 
         #pragma unroll
-        for (int sh = 0; sh < 2; ++sh) {
+        for (int sh = 0; sh < n_sh; ++sh) {
             #pragma unroll
             for (int l = 0; l < T_C_KQ::ne; ++l) {
                 const float x = S[sh].x[l] - KQ_max_new;
@@ -347,9 +414,9 @@ static __global__ void flash_attn_ext_f8(
         }
 
         // ---- P (f32) -> f16 fragment (T_B_VKQ), 2 seq halves ----
-        T_B_VKQ P_B[2];
+        T_B_VKQ P_B[n_sh];
         #pragma unroll
-        for (int sh = 0; sh < 2; ++sh) {
+        for (int sh = 0; sh < n_sh; ++sh) {
             P_B[sh] = get_half2(S[sh]);   // tile<16,16,float> -> tile<16,8,half2>
         }
 
@@ -360,9 +427,11 @@ static __global__ void flash_attn_ext_f8(
             #pragma unroll
             for (int l = 0; l < T_C_VKQ::ne; ++l) { O.x[l] = 0.0f; }
             #pragma unroll
-            for (int sh = 0; sh < 2; ++sh) {
+            for (int sh = 0; sh < n_sh; ++sh) {
                 T_A_VKQ V_A;
-                load_ldmatrix(V_A, sVf + oh*16*(nbatch_fa/2) + sh*(nbatch_fa/4), nbatch_fa/2);
+                // Each sh group covers 16 seq = 8 half2 columns of the sVf row; the offset must
+                // NOT be derived from nbatch_fa (nbatch_fa/4 happens to equal 8 only when it is 32).
+                load_ldmatrix(V_A, sVf_cur + oh*16*(nbatch_fa/2) + sh*8, nbatch_fa/2);
                 // mma convention: D = B x A^T  ->  D[m][n] = B[m]*A[n]
                 // want O[m=head_out][n=seq_q] = V[m]*P[n]  =>  A=P, B=V
                 mma(O, P_B[sh], V_A);   // f16 mma (16-row, f32 C)
@@ -372,7 +441,7 @@ static __global__ void flash_attn_ext_f8(
                 VKQ_C[oh].x[l] += O.x[l];
             }
         }
-        __syncthreads();
+        __syncthreads();   // the buffer just consumed may now be refilled by the next prefetch
     }
 
     // ------------------------------------------------------------------
@@ -425,11 +494,11 @@ static void ggml_cuda_flash_attn_ext_mma_f8_case_impl(ggml_backend_cuda_context 
 
     // SRAM size
     const size_t nbytes_shared =
-         16*(DKQ/4)*(size_t)sizeof(int)
-      + 32*(DKQ/4)*(size_t)sizeof(int)
-      + 32*(DKQ/32)*(size_t)sizeof(float)
-      + (size_t)DV*16*sizeof(half2)
-      + 32*sizeof(float);   // sScale[16] + sRowsum[16]
+         16*(DKQ/4)*(size_t)sizeof(int)          // sQ
+      + 2*32*(DKQ/4)*(size_t)sizeof(int)        // sK    x2 buffers (nbatch_fa = 32)
+      + 2*32*(DKQ/32)*(size_t)sizeof(float)     // sKd   x2 buffers (nbatch_fa = 32)
+      + (size_t)2*DV*16*sizeof(half2)           // sVf   x2 buffers (nbatch_fa/2 = 16)
+      + 32*sizeof(float);                       // sScale[16] + sRowsum[16]
 
     float scale;
     float max_bias;

@@ -84,6 +84,57 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
     return data;
 }
 
+// F8 KV: e4m3 quants are decoded to f16 in registers, then fed to the same dot product as f16 K.
+// K is a row of D/QK_F8 block_f8 groups; each group holds one f16 scale plus 32 consecutive e4m3
+// bytes, so unlike f16 K the values cannot be copied out as one contiguous half2 row: the half2 at
+// row index kh2 lives in group kh2/(QK_F8/2) at byte offset 2*(kh2 % (QK_F8/2)).
+// The per-group scale is folded in before accumulating, since it varies along the contraction dim.
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f8(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    const block_f8 * K_f8 = (const block_f8 *) K_c;
+
+    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+    constexpr int cpy_ne = cpy_nb/4;             // half2 per thread per step
+    constexpr int h2_per_group = QK_F8/2;        // 16 half2 per scale group
+    static_assert(QK_F8 % 2 == 0, "bad QK_F8");
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+        half2 tmp[cpy_ne];
+#pragma unroll
+        for (int l = 0; l < cpy_ne; ++l) {
+            const int kh2 = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne + l;
+            const int g   = kh2 / h2_per_group;
+            const int e   = 2*(kh2 % h2_per_group);
+            // Scale in f32 and narrow once. The scale is itself stored as f16, so scaling with
+            // __hmul2 in the f16 domain rounds twice (the product, then the stored operand), while
+            // the f16 reference path computes value*d in f32 and casts exactly once. Doing the
+            // multiply in f32 here keeps this dot product numerically in line with the matrix
+            // kernel; the dot itself still uses v_dot2_f32_f16 (f32 accumulator) below.
+            const float d  = K_f8[g].d;
+            const float2 v = ggml_cuda_e4m3x2_to_fp32(K_f8[g].qs[e], K_f8[g].qs[e + 1]);
+            tmp[l] = __floats2half2_rn(v.x*d, v.y*d);
+        }
+#pragma unroll
+        for (int l = 0; l < cpy_ne; ++l) {
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            ggml_cuda_mad(sum,               tmp[l], ((const half2  *) Q_v)[k_KQ_0/nthreads + l]);
+#else
+            ggml_cuda_mad(sum, __half22float2(tmp[l]), ((const float2 *) Q_v)[k_KQ_0/nthreads + l]);
+#endif // V_DOT2_F32_F16_AVAILABLE
+        }
+    }
+
+    return sum;
+}
+
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds_v) {
@@ -584,6 +635,43 @@ static __device__ __forceinline__ void dequantize_V_q5_1(const void * __restrict
     }
 }
 
+// F8 V -> f16 (or f32) using the integer e4m3 conversion, with the group scale applied in 16-bit
+// lanes. ne elements are read from row offset i0; ne <= 4 and i0 is a multiple of ne, so the slice
+// never straddles a block_f8 group boundary.
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_f8(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_f8 * x = (const block_f8 *) vx;
+
+    const int64_t ib  = i0 / QK_F8;
+    const int     iqs = i0 % QK_F8;
+
+    static_assert(ne % 2 == 0, "bad ne");
+
+    const float d = x[ib].d;
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same<T, half>::value) {
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            // Decode to f32, scale in f32, then narrow once. Multiplying with __hmul2 in the f16
+            // domain would round twice (the product and the stored operand), whereas the reference
+            // dequantize_f8() computes value*d in f32 from the same f16 scale. Staying in f32 here
+            // keeps this path bit-comparable with the dequant-to-f16 route it replaces.
+            const float2 v = ggml_cuda_e4m3x2_to_fp32(x[ib].qs[iqs + l0], x[ib].qs[iqs + l0 + 1]);
+            ((half2 *) dst)[l0/2] = __floats2half2_rn(v.x*d, v.y*d);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same<T, float>::value) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = d * ggml_cuda_e4m3_to_fp32_signed(x[ib].qs[iqs + l]);
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_q8_0 * x = (const block_q8_0 *) vx;
@@ -631,6 +719,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q5_1<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q8_0) {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_F8) {
+        return vec_dot_fattn_vec_KQ_f8<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
     } else {
@@ -653,6 +743,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q5_1<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q8_0) {
         return dequantize_V_q8_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_F8) {
+        return dequantize_V_f8<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
     } else {

@@ -921,6 +921,94 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32_raw(uint8_t x) {
 #endif // defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
 }
 
+// Signed e4m3 -> f32: the decode convention the F8 KV cache is written with, matching
+// dequantize_f8() in dequantize.cuh. Note the sign bit has to be handled separately here, because
+// ggml_cuda_ue4m3_to_fp32_raw() decodes the unsigned "ue4m3" variant and ignores bit 7.
+static __device__ __forceinline__ float ggml_cuda_e4m3_to_fp32_signed(const uint8_t b) {
+    return (b & 0x80 ? -1.0f : 1.0f) * ggml_cuda_ue4m3_to_fp32_raw(b & 0x7F);
+}
+
+// e4m3 -> f16 as a pure integer bit manipulation, with no f32 intermediate.
+//
+// e4m3 and f16 are both sign/exponent/mantissa formats, so shifting the 7 non-sign bits of the
+// e4m3 code left by 7 lines the 4-bit exponent and 3-bit mantissa up against f16's 5-bit exponent
+// and 10-bit mantissa, and adding 1 << 13 re-biases the exponent from e4m3's 7 to f16's 15. For
+// every one of the 254 finite e4m3 codes this is exact. It is used instead of decoding to f32 and
+// narrowing because f32 lanes cost twice the register space of the 16-bit lanes actually needed,
+// and gfx12 has no direct e4m3x2 -> f16x2 instruction (that one requires gfx1250).
+//
+// e4m3 subnormals (exponent field 0, magnitude < 2^-6) do not map onto an f16 exponent field of 0,
+// but they are comfortably normal in f16 (whose own subnormal range starts at 2^-24), so they are
+// renormalized explicitly. e4m3 has no infinity; the two NaN codes map to 0 as elsewhere in ggml.
+static __device__ __forceinline__ uint16_t ggml_cuda_e4m3_to_f16_bits(const uint8_t b) {
+    const uint16_t sign = (uint16_t) ((b >> 7) & 1u) << 15;
+    const uint8_t  e    = (b >> 3) & 0x0Fu;
+    const uint8_t  m    = b & 0x07u;
+
+    if (e != 0) {
+        if (e == 0x0Fu && m == 0x07u) {
+            return 0;   // NaN -> 0, matching the ggml convention
+        }
+        return (uint16_t) (sign | ((((uint16_t) (b & 0x7Fu) << 7) + 0x2000u) & 0x7FFFu));
+    }
+    if (m == 0) {
+        return sign;    // +-0
+    }
+    int p = 2;
+    while (((m >> p) & 1u) == 0u) {
+        --p;
+    }
+    const uint16_t frac = (uint16_t) (m & ((1u << p) - 1u));
+    const int      ex   = -9 + p + 15;
+    return (uint16_t) (sign | ((uint16_t) ex << 10) | (uint16_t) (frac << (10 - p)));
+}
+
+// Two e4m3 codes packed into one half2 (lane 0 = b0).
+//
+// On gfx12 this goes through the hardware e4m3x2 -> f32x2 conversion followed by a narrowing pack:
+// both are single instructions, giving a branch-free sequence. The integer path below needs an
+// exponent test plus a subnormal renormalization loop per element, which is worse where this runs
+// once per element (the vector attention kernel's Q.K dot product).
+// The two agree bit-for-bit on all 254 finite e4m3 codes; they differ only for the two NaN codes,
+// which the KV cache never contains (the quantizer scales by amax/448, so every value is finite).
+//
+// Declared after ggml_cuda_e4m3x2_to_fp32 so the hardware path can use it.
+static __device__ __forceinline__ half2 ggml_cuda_e4m3x2_to_half2(const uint8_t b0, const uint8_t b1);
+
+// Decode TWO independent SIGNED e4m3 bytes to f32 with a single hardware instruction on gfx12
+// (v_cvt_pk_f32_fp8). The two bytes need not be adjacent in memory. On other architectures this
+// falls back to the portable software decode.
+//
+// Note this is NOT the same as ggml_cuda_ue4m3_to_fp32_raw(): that helper decodes the UNSIGNED
+// ue4m3 variant and ignores bit 7, so it must not be fed a signed e4m3 byte as-is.
+static __device__ __forceinline__ float2 ggml_cuda_e4m3x2_to_fp32(uint8_t b0, uint8_t b1) {
+#if defined(GGML_USE_HIP) && defined(RDNA4)
+    using f32x2_t = __attribute__((ext_vector_type(2))) float;
+    const uint32_t packed = (uint32_t) b0 | ((uint32_t) b1 << 8);
+    const f32x2_t v = __builtin_amdgcn_cvt_pk_f32_fp8(packed, false);
+    return make_float2(v[0], v[1]);
+#else
+    const int s0 = (b0 >> 7) & 0x1, e0 = (b0 >> 3) & 0xF, m0 = b0 & 0x7;
+    const int s1 = (b1 >> 7) & 0x1, e1 = (b1 >> 3) & 0xF, m1 = b1 & 0x7;
+    const float v0 = (e0 == 0xF && m0 == 0x7) ? 0.0f : ldexpf(1.0f + (float) m0*(1.0f/8.0f), e0 - 7);
+    const float v1 = (e1 == 0xF && m1 == 0x7) ? 0.0f : ldexpf(1.0f + (float) m1*(1.0f/8.0f), e1 - 7);
+    return make_float2(s0 ? -v0 : v0, s1 ? -v1 : v1);
+#endif
+}
+
+static __device__ __forceinline__ half2 ggml_cuda_e4m3x2_to_half2(const uint8_t b0, const uint8_t b1) {
+#if defined(GGML_USE_HIP) && defined(RDNA4)
+    const float2 v = ggml_cuda_e4m3x2_to_fp32(b0, b1);
+    return __floats2half2_rn(v.x, v.y);
+#else
+    const uint32_t packed = (uint32_t) ggml_cuda_e4m3_to_f16_bits(b0) |
+                            ((uint32_t) ggml_cuda_e4m3_to_f16_bits(b1) << 16);
+    half2 h;
+    memcpy(&h, &packed, sizeof(h));
+    return h;
+#endif
+}
+
 // Exact e2m1 (OCP FP4, 4-bit) -> e4m3 (FP8, 8-bit) expansion.
 // The 8 e2m1 magnitudes {0, 0.5, 1, 1.5, 2, 3, 4, 6} are all exactly representable in e4m3
 // (mantissas 1.0 / 1.5, wide enough exponent range), so MXFP4 / NVFP4 weights can be fed to the
@@ -990,6 +1078,22 @@ __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_e4m3(float v) {
     }
     return s | (uint8_t) (e << 3) | (uint8_t) m;
 }
+// Encode TWO f32 values to two packed e4m3 bytes with one hardware instruction on gfx12
+// (v_cvt_pk_fp8_f32). Low byte = `a`, second byte = `b`.
+//
+// Exists because the scalar software encoder above costs a frexpf plus several rounding branches
+// per element, which made the F8 KV-cache write about 6x slower than the Q8_0 one (that one only
+// needs a roundf). The two were verified to agree on 1M sampled values across the range the
+// quantizer actually produces (|x| <= 448 after scaling by 448/amax).
+static __device__ __forceinline__ uint16_t ggml_cuda_fp32x2_to_e4m3x2(float a, float b) {
+#if defined(GGML_USE_HIP) && defined(RDNA4)
+    const uint32_t packed = __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0u, false);
+    return (uint16_t) (packed & 0xFFFFu);
+#else
+    return (uint16_t) ((uint32_t) ggml_cuda_fp32_to_e4m3(a) | ((uint32_t) ggml_cuda_fp32_to_e4m3(b) << 8));
+#endif
+}
+
 
 __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e) {
     const uint8_t sign_bit = (x < 0.0f) << 3;

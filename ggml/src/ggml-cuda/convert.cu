@@ -259,6 +259,45 @@ static void dequantize_block_cont_cuda(const void * __restrict__ vx, dst_t * __r
     dequantize_block_cuda<qk, qr, dequantize_kernel, dst_t>(vx, y, k, 1, 1, 1, k/qk, k/qk, k/qk, stream);
 }
 
+
+template <bool need_check>
+static __global__ void dequantize_block_f8_f16(const void * __restrict__ vx, half * __restrict__ y, const int64_t k) {
+    constexpr int ne_align = 2048;                                 // elements per block
+    constexpr int ngroups  = ne_align/QK_F8;                       // QK_F8 = 32 => 64 scale groups
+    static_assert(ne_align % QK_F8 == 0, "bad alignment");
+
+    const int64_t   i0 = (int64_t) ne_align*blockIdx.x;
+    const block_f8 * x = (const block_f8 *) vx + i0/QK_F8;
+
+    // One scale group per thread: the group scale is read once and its 32 e4m3 bytes become 16
+    // half2 stores, with the scale folded in by one half2 multiply at the end.
+    for (int g = threadIdx.x; g < ngroups; g += WARP_SIZE) {
+        if (need_check && i0 + (int64_t) g*QK_F8 >= k) {
+            return;
+        }
+        const block_f8 * b   = x + g;
+        const half2      d2  = __half2half2(b->d);
+        half2 * dst = (half2 *) (y + i0 + (int64_t) g*QK_F8);
+        // A group is QK_F8 = 32 elements = QK_F8/2 = 16 half2, so this writes exactly one half2
+        // per iteration (2 e4m3 bytes per half2).
+        #pragma unroll
+        for (int q = 0; q < QK_F8/2; ++q) {
+            dst[q] = __hmul2(ggml_cuda_e4m3x2_to_half2(b->qs[2*q + 0], b->qs[2*q + 1]), d2);
+        }
+    }
+}
+
+static void dequantize_block_f8_f16_cuda(const void * __restrict__ vx, half * __restrict__ y, const int64_t k, cudaStream_t stream) {
+    constexpr int ne_align = 2048;
+    const int num_blocks = (int) ((k + ne_align - 1) / ne_align);
+    const dim3 block(WARP_SIZE);
+    if (k % ne_align == 0) {
+        dequantize_block_f8_f16<false><<<num_blocks, block, 0, stream>>>(vx, y, k);
+    } else {
+        dequantize_block_f8_f16<true><<<num_blocks, block, 0, stream>>>(vx, y, k);
+    }
+}
+
 static void dequantize_block_q8_0_f16_cuda(const void * __restrict__ vx, half * __restrict__ y, const int64_t k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_Q8_0_NE_ALIGN - 1) / CUDA_Q8_0_NE_ALIGN;
     if (k % CUDA_Q8_0_NE_ALIGN == 0) {
@@ -566,7 +605,7 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             }
             return dequantize_block_cont_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_F8:
-            return dequantize_block_cont_cuda<QK_F8, QR_F8, dequantize_f8>;
+            return dequantize_block_f8_f16_cuda;
         case GGML_TYPE_Q2_K:
             return dequantize_row_q2_K_cuda;
         case GGML_TYPE_Q3_K:

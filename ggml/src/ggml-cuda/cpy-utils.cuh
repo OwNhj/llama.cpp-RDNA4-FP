@@ -167,8 +167,14 @@ static __device__ void quantize_f32_f8_block(const float * __restrict__ x, block
 
     y->d = d;
 
-    for (int j = 0; j < QK_F8; ++j) {
-        y->qs[j] = ggml_cuda_fp32_to_e4m3(x[j]*id);
+    // Two values per hardware conversion instruction instead of one software encode per element:
+    // this kernel runs on every KV write, and the scalar encoder (frexpf + rounding branches) made
+    // it about 6x slower than the equivalent Q8_0 quantizer.
+    #pragma unroll
+    for (int j = 0; j < QK_F8; j += 2) {
+        const uint16_t q = ggml_cuda_fp32x2_to_e4m3x2(x[j]*id, x[j + 1]*id);
+        y->qs[j + 0] = (uint8_t) (q & 0xFFu);
+        y->qs[j + 1] = (uint8_t) (q >> 8);
     }
 }
 

@@ -677,11 +677,14 @@ static __global__ void quantize_mmq_mxfp8(
     }
 
     const float d_inv = 448.0f / amax;
-    char4 q;
-    q.x = ggml_cuda_fp32_to_e4m3(xi.x*d_inv);
-    q.y = ggml_cuda_fp32_to_e4m3(xi.y*d_inv);
-    q.z = ggml_cuda_fp32_to_e4m3(xi.z*d_inv);
-    q.w = ggml_cuda_fp32_to_e4m3(xi.w*d_inv);
+    // Two values per hardware conversion instruction (v_cvt_pk_fp8_f32 on gfx12) instead of one
+    // software encode per value: the scalar encoder needs a frexpf plus rounding branches, which
+    // made this kernel ~30% more expensive than its q8_1 counterpart. The d_inv scaling keeps
+    // |x*d_inv| <= 448, i.e. exactly the range the hardware conversion covers.
+    const uint32_t q01 = ggml_cuda_fp32x2_to_e4m3x2(xi.x*d_inv, xi.y*d_inv);
+    const uint32_t q23 = ggml_cuda_fp32x2_to_e4m3x2(xi.z*d_inv, xi.w*d_inv);
+    char4 q = make_char4((int8_t) (q01 & 0xFFu), (int8_t) ((q01 >> 8) & 0xFFu),
+                         (int8_t) (q23 & 0xFFu), (int8_t) ((q23 >> 8) & 0xFFu));
     const float d = 1.0f / d_inv;
 
     // write the block once (normal) or to each of the token's compact rows (scatter)

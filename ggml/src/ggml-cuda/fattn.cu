@@ -423,6 +423,9 @@ typedef void (* fattn_vec_case_t)(ggml_backend_cuda_context & ctx, ggml_tensor *
 
 // Vector kernel for the given head size and K/V types, nullptr if its template instance was not compiled:
 static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, const ggml_type type_K, const ggml_type type_V) {
+    FATTN_VEC_CASES_ALL_D(F8,   F8)
+    FATTN_VEC_CASES_ALL_D(F8,   F16)
+    FATTN_VEC_CASES_ALL_D(F16,  F8)
     FATTN_VEC_CASES_ALL_D(F16,  F16)
     FATTN_VEC_CASES_ALL_D(Q4_0, F16)
     FATTN_VEC_CASES_ALL_D(Q4_1, F16)
@@ -689,7 +692,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
         // Native fp8 FA for F8 KV (RDNA4, head 96/128): K read as e4m3 (no dequant to f16),
         // V dequants to f16 (its per-32-head_out-group scale is non-factorable in a native fp8 mma).
-        if (K->type == GGML_TYPE_F8 && V->type == GGML_TYPE_F8 && (Q->ne[0] == 96 || Q->ne[0] == 128)) {
+        // F8 KV uses the same route as Q8_0: launch_fattn dequantizes K/V to f16 (to_fp16, which is
+        // registered for F8 and uses the e4m3-specialized kernel in convert.cu) and the mature
+        // MMA_F16 kernel does the attention. Measured on gfx1201 this beats the native fp8 WMMA
+        // kernel on both quality and speed: the f16 kernel brings ncols2=8, multiple warps, nstages=2
+        // and stream-K, while a fp8 kernel written from scratch reached only ~2% of fp8 peak.
+        // The native kernel can still be forced with F8_NATIVE=1 for comparison.
+        if (getenv("F8_NATIVE") != nullptr &&
+                K->type == GGML_TYPE_F8 && V->type == GGML_TYPE_F8 && (Q->ne[0] == 96 || Q->ne[0] == 128)) {
             return BEST_FATTN_KERNEL_MMA_F8;
         }
         return BEST_FATTN_KERNEL_MMA_F16;
