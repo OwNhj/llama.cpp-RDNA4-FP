@@ -936,7 +936,10 @@ class ModelBase:
         n_blocks = in_features // 256
 
         w = weight.view(torch.uint8).numpy().reshape(out_features, n_blocks, 256)
-        s = _mxfp8_e8m0_bytes(scale).reshape(out_features, n_blocks, 8)
+        # ModelBase._mxfp8_e8m0_bytes is a staticmethod on this class, so it has to be referenced
+        # through the class -- the bare name is not bound inside another staticmethod, which raised
+        # NameError and made the whole OCP MXFP8 repack path unusable.
+        s = ModelBase._mxfp8_e8m0_bytes(scale).reshape(out_features, n_blocks, 8)
 
         raw = np.concatenate([w, s], axis=-1).reshape(out_features, n_blocks * 264)
         return raw, [out_features, in_features]
