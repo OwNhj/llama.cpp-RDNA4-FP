@@ -5182,12 +5182,6 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
-        case GGML_TYPE_Q4_0_ROCMFP4:
-        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-        case GGML_TYPE_Q2_0_ROCMFPX:
-        case GGML_TYPE_Q3_0_ROCMFPX:
-        case GGML_TYPE_Q6_0_ROCMFPX:
-        case GGML_TYPE_Q8_0_ROCMFPX:
         case GGML_TYPE_Q4_0_ROCMI4:
             {
                 ggml_compute_forward_get_rows_q(params, dst);

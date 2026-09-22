@@ -5711,12 +5711,6 @@ class GGMLQuantizationType(IntEnum):
     MXFP4   = 39
     NVFP4   = 40
     Q1_0    = 41
-    Q4_0_ROCMFP4      = 100
-    Q4_0_ROCMFP4_FAST = 101
-    Q6_0_ROCMFPX      = 102
-    Q8_0_ROCMFPX      = 103
-    Q3_0_ROCMFPX      = 104
-    Q2_0_ROCMFPX      = 107
     Q4_0_ROCMI4       = 108
     Q2_0    = 42
     MXFP8   = 43

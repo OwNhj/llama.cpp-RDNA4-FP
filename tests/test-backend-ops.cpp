@@ -9919,9 +9919,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // rocmf custom quantized types (ROCm native tensor-core paths): MUL_MAT regression +
     // WMMA verification. CPU reference via dequant (to_float); GPU via int8/i4 WMMA MMQ + MMVQ.
-    for (ggml_type type_a : { GGML_TYPE_Q4_0_ROCMI4,
-                              GGML_TYPE_Q3_0_ROCMFPX, GGML_TYPE_Q6_0_ROCMFPX,
-                              GGML_TYPE_Q8_0_ROCMFPX, GGML_TYPE_Q2_0_ROCMFPX }) {
+    for (ggml_type type_a : { GGML_TYPE_Q4_0_ROCMI4 }) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, i, 1*256, {1, 1}, {1, 1}));
         }
@@ -9929,16 +9927,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 8, 16*256, {1, 1}, {1, 1}));
     }
 
-    // REAL model linear-layer shapes (MMQ large-m path, not covered by the m=16 block above).
-    // Qwen3-4B: hidden=2560, attn out=4096. These expose large-m MMQ bugs.
-    for (ggml_type type_a : { GGML_TYPE_Q2_0_ROCMFPX, GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_Q4_0_ROCMFP4_FAST }) {
-        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, 1,  2560, {1, 1}, {1, 1}));
-        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, 32, 2560, {1, 1}, {1, 1}));
-        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2560, 1,  4096, {1, 1}, {1, 1}));
-        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2560, 64, 4096, {1, 1}, {1, 1}));
-        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 9728, 1,  2560, {1, 1}, {1, 1}));
-        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2560, 32, 9728, {1, 1}, {1, 1}));
-    }
 
     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {

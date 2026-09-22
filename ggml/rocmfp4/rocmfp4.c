@@ -590,42 +590,6 @@ void rocmfp4_quantize_row_q4_0_fast(const float * GGML_RESTRICT x, void * GGML_R
     rocmfp4_quantize_row_q4_0_fast_ref(x, (block_rocmfp4_fast *) y, k);
 }
 
-size_t rocmfp4_quantize_q4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
-    const size_t row_size = ggml_row_size(GGML_TYPE_Q4_0_ROCMFP4, n_per_row);
-
-    if (!imatrix) {
-        rocmfp4_quantize_row_q4_0_ref(src, (block_rocmfp4 *) dst, nrows*n_per_row);
-        return nrows * row_size;
-    }
-
-    char * qrow = (char *) dst;
-    for (int64_t row = 0; row < nrows; ++row) {
-        rocmfp4_quantize_row_q4_0_weighted(src, (block_rocmfp4 *) qrow, n_per_row, imatrix);
-        src += n_per_row;
-        qrow += row_size;
-    }
-
-    return nrows * row_size;
-}
-
-size_t rocmfp4_quantize_q4_0_fast(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
-    const size_t row_size = ggml_row_size(GGML_TYPE_Q4_0_ROCMFP4_FAST, n_per_row);
-
-    if (!imatrix) {
-        rocmfp4_quantize_row_q4_0_fast_ref(src, (block_rocmfp4_fast *) dst, nrows*n_per_row);
-        return nrows * row_size;
-    }
-
-    char * qrow = (char *) dst;
-    for (int64_t row = 0; row < nrows; ++row) {
-        rocmfp4_quantize_row_q4_0_fast_weighted(src, (block_rocmfp4_fast *) qrow, n_per_row, imatrix);
-        src += n_per_row;
-        qrow += row_size;
-    }
-
-    return nrows * row_size;
-}
-
 bool rocmfp4_validate_row_data(const void * data, size_t nbytes) {
     if (nbytes % sizeof(block_rocmfp4) != 0) {
         return false;
