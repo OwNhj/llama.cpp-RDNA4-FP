@@ -326,7 +326,7 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_Q8_0_ROCMFPX, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
     CASE(GGML_TYPE_Q4_0_ROCMFP4_FAST, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
         #if GGML_ROCMI4_W4A4 // ROCMI4_W4A4_CONFIG: native i4 W4A4 (J % 16 == 0 only)
-        CASE(GGML_TYPE_Q4_0_ROCMI4, 256,2,128,128,GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4,MMQ_ITER_K,false,true);
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 128,2,64,128,GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4,MMQ_ITER_K,false,true);
         #else
         CASE(GGML_TYPE_Q4_0_ROCMI4, 256,2,128,128,GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,MMQ_ITER_K,false,true);
         #endif
@@ -382,7 +382,7 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_Q8_0_ROCMFPX, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
     CASE(GGML_TYPE_Q4_0_ROCMFP4_FAST, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
         #if GGML_ROCMI4_W4A4 // ROCMI4_W4A4_CONFIG: native i4 W4A4 (J % 16 == 0 only)
-        CASE(GGML_TYPE_Q4_0_ROCMI4, 256,2,128,128,GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4,MMQ_ITER_K,false,false);
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 128,2,64,128,GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4,MMQ_ITER_K,false,false);
         #else
         CASE(GGML_TYPE_Q4_0_ROCMI4, 256,2,128,128,GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,MMQ_ITER_K,false,false);
         #endif
