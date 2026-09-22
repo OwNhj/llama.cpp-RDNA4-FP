@@ -36,6 +36,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q2_0",     LLAMA_FTYPE_MOSTLY_Q2_0,     " 2.25 bpw quantization (group 64)",  },
     { "Q4_0",     LLAMA_FTYPE_MOSTLY_Q4_0,     " 4.34G, +0.4685 ppl @ Llama-3-8B",  },
     { "Q4_1",     LLAMA_FTYPE_MOSTLY_Q4_1,     " 4.78G, +0.4511 ppl @ Llama-3-8B",  },
+    { "Q4_0_ROCMI4",           LLAMA_FTYPE_MOSTLY_Q4_0_ROCMI4,           " 4.25 bpw native signed-nibble 4-bit (no codebook)", },
     { "MXFP4_MOE",LLAMA_FTYPE_MOSTLY_MXFP4_MOE," MXFP4 MoE",  },
     { "MXFP4",    LLAMA_FTYPE_MOSTLY_MXFP4,    " 4.5 bpw MX FP4 (OCP, E2M1 + E8M0)", },
     { "NVFP4",    LLAMA_FTYPE_MOSTLY_NVFP4,    " 4.25 bpw NV FP4 (OCP, E2M1 + UE4M3)", },
@@ -586,6 +587,9 @@ int llama_quantize(int argc, char ** argv) {
         arg_idx++;
         if (ftype_str == "COPY") {
             params.only_copy = true;
+        }
+        if (ftype_str == "Q4_0_ROCMFP4_EVEN" || ftype_str == "Q4_0_ROCMFP4_FAST_EVEN") {
+            params.pure = true;
         }
     } else {
         // argv[arg_idx] is not a valid ftype, so treat it as output path: <input> <output> <ftype>

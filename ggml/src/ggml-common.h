@@ -1152,6 +1152,14 @@ GGML_TABLE_BEGIN(int8_t, kvalues_fp4, 16)
 GGML_TABLE_END()
 #define kvalues_mxfp4 kvalues_fp4
 
+// ROCmFP4 uses an E2M1-derived value set with the largest level retuned from
+// 12 to 10, plus dual half-block UE4M3 scales. Keeping this separate from
+// MXFP4 lets the experimental Strix Halo format evolve without changing stock
+// MXFP4/NVFP4 behavior.
+GGML_TABLE_BEGIN(int8_t, kvalues_rocmfp4, 16)
+    0, 1, 2, 3, 4, 6, 8, 10, 0, -1, -2, -3, -4, -6, -8, -10,
+GGML_TABLE_END()
+
 #if defined(GGML_COMMON_IMPL_C)
 // E4M3 values (without sign, index = e4m3 bits & 0x7F) scaled by 512 for fixed-point accumulation
 // dequant: value = sign * GGML_E8M0_TO_FP32(e) * (1/512) * kvalues_mxfp8[qs & 0x7F]

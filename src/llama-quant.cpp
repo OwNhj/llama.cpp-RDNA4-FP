@@ -395,6 +395,13 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_TQ1_0:
             case GGML_TYPE_TQ2_0:   return_type = GGML_TYPE_Q4_0;   break;
+            case GGML_TYPE_Q4_0_ROCMFP4:
+            case GGML_TYPE_Q4_0_ROCMFP4_FAST: return_type = GGML_TYPE_Q4_0; break;
+            case GGML_TYPE_Q3_0_ROCMFPX:
+            case GGML_TYPE_Q2_0_ROCMFPX:
+            case GGML_TYPE_Q6_0_ROCMFPX:
+            case GGML_TYPE_Q8_0_ROCMFPX: return_type = GGML_TYPE_Q8_0; break;
+            case GGML_TYPE_Q4_0_ROCMI4: return_type = GGML_TYPE_Q4_0; break;
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
@@ -438,6 +445,7 @@ static llama_ftype fp_ftype_mirror(llama_ftype ftype) {
     switch (ftype) {
         case LLAMA_FTYPE_MOSTLY_MXFP4:
         case LLAMA_FTYPE_MOSTLY_NVFP4:
+        case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMI4:
             return LLAMA_FTYPE_MOSTLY_Q4_0;
         case LLAMA_FTYPE_MOSTLY_MXFP8:
             return LLAMA_FTYPE_MOSTLY_Q8_0;
@@ -459,7 +467,8 @@ static ggml_type fp_type_from_mirror(ggml_type t, ggml_type fp_type) {
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
-            return (fp_type == GGML_TYPE_MXFP4 || fp_type == GGML_TYPE_NVFP4) ? fp_type : t;
+            return (fp_type == GGML_TYPE_MXFP4 || fp_type == GGML_TYPE_NVFP4 ||
+                    fp_type == GGML_TYPE_Q4_0_ROCMI4) ? fp_type : t;
         case GGML_TYPE_Q8_0:
             return (fp_type == GGML_TYPE_MXFP8) ? fp_type : t;
         default:
@@ -508,6 +517,118 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             }
         }
         return std::make_pair(i_layer, n_layer);
+    };
+    auto rocmfpx_is_q3_agent = [] (llama_ftype ftype) {
+        return ftype == LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX_AGENT;
+    };
+    auto rocmfpx_is_q6_agent = [] (llama_ftype ftype) {
+        return ftype == LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT;
+    };
+    auto rocmfpx_is_q6_agent_lean = [] (llama_ftype ftype) {
+        return ftype == LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT_LEAN;
+    };
+    auto rocmfpx_is_q6_lean = [] (llama_ftype ftype) {
+        return ftype == LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_LEAN ||
+               ftype == LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT_LEAN;
+    };
+    auto rocmfpx_is_q8_agent = [] (llama_ftype ftype) {
+        return ftype == LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX_AGENT;
+    };
+    auto rocmfpx_is_q3_family = [&] (llama_ftype ftype) {
+        return ftype == LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX || rocmfpx_is_q3_agent(ftype);
+    };
+    auto rocmfpx_is_q6_family = [&] (llama_ftype ftype) {
+        return ftype == LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX ||
+               rocmfpx_is_q6_agent(ftype) ||
+               rocmfpx_is_q6_lean(ftype);
+    };
+    auto rocmfpx_is_q8_family = [&] (llama_ftype ftype) {
+        return ftype == LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX || rocmfpx_is_q8_agent(ftype);
+    };
+    auto rocmfpx_is_family = [&] (llama_ftype ftype) {
+        return rocmfpx_is_q3_family(ftype) || rocmfpx_is_q6_family(ftype) || rocmfpx_is_q8_family(ftype);
+    };
+    auto rocmfpx_sensitive_tensor_type = [&] (llama_ftype ftype) {
+        switch (ftype) {
+            case LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX: return GGML_TYPE_Q4_0_ROCMFP4_FAST;
+            case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX: return GGML_TYPE_Q6_0_ROCMFPX;
+            case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_LEAN: return GGML_TYPE_Q6_0_ROCMFPX;
+            case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT_LEAN: return GGML_TYPE_Q6_K;
+            case LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX: return GGML_TYPE_Q8_0_ROCMFPX;
+            default:
+                if (rocmfpx_is_q3_agent(ftype)) {
+                    return GGML_TYPE_Q6_0_ROCMFPX;
+                }
+                if (rocmfpx_is_q6_agent(ftype)) {
+                    return GGML_TYPE_Q8_0_ROCMFPX;
+                }
+                if (rocmfpx_is_q8_agent(ftype)) {
+                    return GGML_TYPE_Q8_0;
+                }
+                return GGML_TYPE_COUNT;
+        }
+    };
+    auto rocmfpx_q3_needs_down_boost = [&](int i_layer, int n_layer, llama_ftype ftype) -> bool {
+        if (rocmfpx_is_q3_agent(ftype)) {
+            return i_layer < n_layer/8 || use_more_bits(i_layer, n_layer) || i_layer >= n_layer/2;
+        }
+        return i_layer < n_layer/16 || use_more_bits(i_layer, n_layer) || i_layer >= (2*n_layer)/3;
+    };
+    auto rocmfpx_q3_attn_kv_type = [&](int i_layer, int n_layer, llama_ftype ftype) -> ggml_type {
+        if (rocmfpx_is_q3_agent(ftype)) {
+            return i_layer < n_layer/2 ? GGML_TYPE_Q6_K : GGML_TYPE_Q5_K;
+        }
+        return i_layer < n_layer/2 ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K;
+    };
+    auto rocmfpx_q6_needs_down_boost = [&](int i_layer, int n_layer, llama_ftype ftype) -> bool {
+        if (rocmfpx_is_q6_agent_lean(ftype)) {
+            return i_layer < n_layer/16 || i_layer >= 15*n_layer/16;
+        }
+        if (rocmfpx_is_q6_lean(ftype)) {
+            return false;
+        }
+        if (rocmfpx_is_q6_agent(ftype)) {
+            return i_layer < n_layer/8 || i_layer >= 3*n_layer/4 || use_more_bits(i_layer, n_layer);
+        }
+        return i_layer < n_layer/16 || i_layer >= 7*n_layer/8;
+    };
+    auto rocmfpx_q6_needs_attn_boost = [&](int i_layer, int n_layer, llama_ftype ftype) -> bool {
+        if (rocmfpx_is_q6_agent_lean(ftype)) {
+            return i_layer < n_layer/16;
+        }
+        if (rocmfpx_is_q6_lean(ftype)) {
+            return false;
+        }
+        if (rocmfpx_is_q6_agent(ftype)) {
+            return i_layer < n_layer/8 || use_more_bits(i_layer, n_layer);
+        }
+        return i_layer < n_layer/16;
+    };
+    auto rocmfpx_q8_needs_attn_boost = [&](int i_layer, int n_layer, llama_ftype ftype) -> bool {
+        if (rocmfpx_is_q8_agent(ftype)) {
+            return i_layer < n_layer/8 || use_more_bits(i_layer, n_layer) || i_layer >= n_layer/2;
+        }
+        return false;
+    };
+    auto rocmfpx_q8_needs_down_boost = [&](int i_layer, int n_layer, llama_ftype ftype) -> bool {
+        if (rocmfpx_is_q8_agent(ftype)) {
+            return i_layer < n_layer/8 || i_layer >= 3*n_layer/4 || use_more_bits(i_layer, n_layer);
+        }
+        return false;
+    };
+    auto layer_from_name = [&](const std::string & tensor_name, int n_layer) -> std::pair<int, int> {
+        int i_layer = 0;
+        if (sscanf(tensor_name.c_str(), "blk.%d.", &i_layer) == 1) {
+            return { i_layer, n_layer };
+        }
+        static std::mutex warn_mtx;
+        static std::unordered_set<std::string> warned;
+        std::lock_guard<std::mutex> lock(warn_mtx);
+        if (warned.emplace(tensor_name).second) {
+            LLAMA_LOG_WARN("%s: could not parse layer index from tensor '%s', assuming layer 0\n",
+                __func__, tensor_name.c_str());
+        }
+        return { 0, n_layer };
     };
 
     // for arches that share the same tensor between the token embeddings and the output, we quantize the token embeddings
@@ -589,6 +710,35 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                 else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M) new_type = GGML_TYPE_IQ3_S;
             }
         }
+        if (rocmfpx_is_q3_family(ftype)) {
+            auto info = layer_from_name(name, qs.model.hparams.n_layer());
+            new_type = rocmfpx_q3_attn_kv_type(info.first, info.second, ftype);
+        }
+        else if (rocmfpx_is_q6_family(ftype)) {
+            auto info = layer_from_name(name, qs.model.hparams.n_layer());
+            if (rocmfpx_q6_needs_attn_boost(info.first, info.second, ftype)) {
+                new_type = rocmfpx_is_q6_agent_lean(ftype) ? GGML_TYPE_Q6_K : GGML_TYPE_Q8_0_ROCMFPX;
+            }
+        }
+        else if (rocmfpx_is_q8_family(ftype)) {
+            auto info = layer_from_name(name, qs.model.hparams.n_layer());
+            if (rocmfpx_q8_needs_attn_boost(info.first, info.second, ftype)) {
+                new_type = GGML_TYPE_Q8_0;
+            }
+        }
+        else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX ||
+            ftype == LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN) {
+            // Strix Halo quality/speed recipe: keep attention V in the
+            // dual-scale ROCmFP4 layout. Together with ATTENTION_K below this
+            // costs about 0.02 BPW on Qwen3-4B and improves the short
+            // WikiText-2 pass while preserving the speed win over stock Q4_0.
+            new_type = GGML_TYPE_Q4_0_ROCMFP4;
+        }
+        else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4) {
+            // Attention V is coherence-sensitive, but on Qwen3-4B Q5_K tested
+            // better than Q6_K while also shaving a little size from the preset.
+            new_type = GGML_TYPE_Q5_K;
+        }
     } else if (category_is_attn_v(category)) {
         if      (ftype == LLAMA_FTYPE_MOSTLY_Q2_K) {
             new_type = qs.model.hparams.n_gqa() >= 4 ? GGML_TYPE_Q4_K : GGML_TYPE_Q3_K;
@@ -621,7 +771,7 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             // nearly negligible increase in model size by quantizing this tensor with more bits:
             if (new_type == GGML_TYPE_Q3_K || new_type == GGML_TYPE_Q4_K) new_type = GGML_TYPE_Q5_K;
         }
-        if (qs.model.hparams.n_expert == 8) {
+        if (qs.model.hparams.n_expert == 8 && !rocmfpx_is_family(ftype)) {
             // for the 8-expert model, bumping this to Q8_0 trades just ~128MB
             // TODO: explore better strategies
             new_type = GGML_TYPE_Q8_0;
@@ -691,6 +841,26 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             new_type = ftype == LLAMA_FTYPE_MOSTLY_Q4_0 ? GGML_TYPE_Q4_1 : GGML_TYPE_Q5_1;
         }
         ++qs.i_ffn_down;
+        if (rocmfpx_is_q3_family(ftype)) {
+            new_type = rocmfpx_is_q3_agent(ftype) ? GGML_TYPE_Q6_K : GGML_TYPE_Q5_K;
+        }
+        else if (rocmfpx_is_q6_family(ftype)) {
+            auto info = layer_from_name(name, qs.model.hparams.n_layer());
+            if (rocmfpx_q6_needs_attn_boost(info.first, info.second, ftype)) {
+                new_type = rocmfpx_is_q6_agent_lean(ftype) ? GGML_TYPE_Q6_K : GGML_TYPE_Q8_0_ROCMFPX;
+            }
+        }
+        else if (rocmfpx_is_q8_family(ftype)) {
+            auto info = layer_from_name(name, qs.model.hparams.n_layer());
+            if (rocmfpx_q8_needs_attn_boost(info.first, info.second, ftype)) {
+                new_type = GGML_TYPE_Q8_0;
+            }
+        }
+        else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4) {
+            // Output projections are another high-leverage location; Q5_K is
+            // a modest size increase that helps preserve chat coherence.
+            new_type = GGML_TYPE_Q5_K;
+        }
     } else if (category == tensor_category::ATTENTION_OUTPUT) {
         if (arch != LLM_ARCH_FALCON) {
             if (qs.model.hparams.n_expert == 8) {
@@ -739,6 +909,7 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
 }
 
 // outer wrapper: determine the ggml_type that this tensor should be quantized to
+
 static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_model_quantize_params * params, const ggml_tensor * tensor, ggml_type default_type, const tensor_metadata & tm) {
     if (!tensor_allows_quantization(params, qs.model.arch, tensor)) {
         return tensor->type;
@@ -903,6 +1074,16 @@ static bool tensor_requires_imatrix(const char * tensor_name, const ggml_type ds
 // given a file type, get the default tensor type
 //
 
+static bool llama_tensor_allows_requantize_to_rocmfp4(const ggml_type src_type, const ggml_type dst_type) {
+    // ROCmFP4 targets are permitted to requantize (without the global
+    // --allow-requantize flag) from a small set of well-behaved 4-bit sources:
+    // NVFP4 shares the UE4M3 scale encoding per 16-element sub-block, and Q4_0
+    // is the QAT shipping format (re-mapping is not lossless; A/B the result).
+    const bool src_ok = src_type == GGML_TYPE_NVFP4 || src_type == GGML_TYPE_Q4_0;
+    const bool dst_ok = dst_type == GGML_TYPE_Q4_0_ROCMFP4 || dst_type == GGML_TYPE_Q4_0_ROCMFP4_FAST;
+    return src_ok && dst_ok;
+}
+
 ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
     switch (ftype) {
         case LLAMA_FTYPE_MOSTLY_Q4_0: return GGML_TYPE_Q4_0;
@@ -920,6 +1101,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_MXFP8:     return GGML_TYPE_MXFP8;
         case LLAMA_FTYPE_MOSTLY_MXFP4:     return GGML_TYPE_MXFP4;
         case LLAMA_FTYPE_MOSTLY_NVFP4:     return GGML_TYPE_NVFP4;
+        case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMI4: return GGML_TYPE_Q4_0_ROCMI4;
 
         // K-quants
         case LLAMA_FTYPE_MOSTLY_Q2_K_S:
@@ -1331,7 +1513,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     throw std::runtime_error(format("Missing importance matrix for tensor %s in a very low-bit quantization", tensor->name));
                 }
 
-                if (ggml_is_quantized(tensor->type) && !params->allow_requantize) {
+                if (ggml_is_quantized(tensor->type) && !params->allow_requantize &&
+                        !llama_tensor_allows_requantize_to_rocmfp4(tensor->type, new_type)) {
                     throw std::runtime_error(format("requantizing from type %s is disabled", ggml_type_name(tensor->type)));
                 }
 

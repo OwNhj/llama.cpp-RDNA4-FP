@@ -5711,6 +5711,13 @@ class GGMLQuantizationType(IntEnum):
     MXFP4   = 39
     NVFP4   = 40
     Q1_0    = 41
+    Q4_0_ROCMFP4      = 100
+    Q4_0_ROCMFP4_FAST = 101
+    Q6_0_ROCMFPX      = 102
+    Q8_0_ROCMFPX      = 103
+    Q3_0_ROCMFPX      = 104
+    Q2_0_ROCMFPX      = 107
+    Q4_0_ROCMI4       = 108
     Q2_0    = 42
     MXFP8   = 43
 
@@ -5906,6 +5913,13 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.MXFP4:   (32, 1 + 16),
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
+    GGMLQuantizationType.Q4_0_ROCMFP4:      (32, 2 + 16),
+    GGMLQuantizationType.Q4_0_ROCMFP4_FAST: (32, 1 + 16),
+    GGMLQuantizationType.Q6_0_ROCMFPX:      (32, 24 + 2),
+    GGMLQuantizationType.Q8_0_ROCMFPX:      (32, 32 + 1),
+    GGMLQuantizationType.Q3_0_ROCMFPX:      (32, 12 + 2),
+    GGMLQuantizationType.Q2_0_ROCMFPX:      (32, 8 + 2),
+    GGMLQuantizationType.Q4_0_ROCMI4:       (32, 1 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
     GGMLQuantizationType.MXFP8:   (256, 256 + 8),
 }

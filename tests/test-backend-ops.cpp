@@ -4849,6 +4849,122 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 };
 
+// GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
+struct test_gated_delta_net_cache_fusion : public test_case {
+    const ggml_type type;
+
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int64_t K; // snapshot slot count (>1)
+
+    ggml_tensor * cpy_node = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, head_count, head_size, n_seq_tokens, n_seqs, K);
+    }
+
+    test_gated_delta_net_cache_fusion(ggml_type type = GGML_TYPE_F32,
+            int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 2, int64_t n_seqs = 1,
+            int64_t K = 2)
+        : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S_v = head_size;
+        const int64_t H_v = head_count;
+        const int64_t H_k = head_count;
+        const int64_t D   = S_v * S_v * H_v;
+        const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+
+        ggml_tensor * q     = ggml_new_tensor_4d(ctx, type, head_size, H_k, n_seq_tokens, n_seqs);
+        ggml_tensor * k     = ggml_new_tensor_4d(ctx, type, head_size, H_k, n_seq_tokens, n_seqs);
+        ggml_tensor * v     = ggml_new_tensor_4d(ctx, type, head_size, H_v, n_seq_tokens, n_seqs);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, 1, H_v, n_seq_tokens, n_seqs);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, H_v, n_seq_tokens, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, type, head_size, head_size, H_v, n_seqs);
+        ggml_set_name(g,     "g");
+        ggml_set_name(beta,  "beta");
+        ggml_set_name(state, "state");
+
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        ggml_tensor * gdn_out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+        ggml_set_name(gdn_out, "gdn_out");
+
+        // attn scores view (first part of the gdn output)
+        ggml_tensor * attn = ggml_view_4d(ctx, gdn_out,
+                S_v, H_v, n_seq_tokens, n_seqs,
+                ggml_row_size(gdn_out->type, S_v),
+                ggml_row_size(gdn_out->type, S_v * H_v),
+                ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens), 0);
+        ggml_set_name(attn, "attn");
+
+        // snapshot tail view [D, n_seqs, n_written]
+        const int64_t attn_score_elems = S_v * H_v * n_seq_tokens * n_seqs;
+        ggml_tensor * src = ggml_view_3d(ctx, gdn_out,
+                D, n_seqs, n_written,
+                ggml_row_size(gdn_out->type, D),
+                ggml_row_size(gdn_out->type, D * n_seqs),
+                ggml_row_size(gdn_out->type, attn_score_elems));
+
+        // recurrent cache view [D, n_seqs, n_written]
+        ggml_tensor * cache = ggml_new_tensor_3d(ctx, type, D, n_seqs, n_written);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * dst = ggml_view_3d(ctx, cache,
+                D, n_seqs, n_written,
+                ggml_row_size(cache->type, D),
+                ggml_row_size(cache->type, D * n_seqs), 0);
+
+        ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
+        ggml_set_name(cpy, "gdn_cache_cpy");
+        cpy_node = cpy;
+
+        // read the cpy output (not the plain dst view, which would not pull the cpy into the graph)
+        // so that neither the gdn nor the cpy is the graph output
+        ggml_tensor * out = ggml_sum(ctx, cpy);
+        return out;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_CACHE_FUSION";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node }; }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        const uint64_t S_v = head_size;
+        const uint64_t H_v = head_count;
+        const uint64_t T   = n_seq_tokens;
+        const uint64_t B   = n_seqs;
+        return (4ull*S_v + 2ull*S_v*S_v) * H_v * T * B;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else if (strcmp(t->name, "cache") == 0) {
+                init_tensor_uniform(t, 0.0f, 0.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -9914,6 +10030,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // long enough that the loop wraps, else the stride is never exercised
         test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  1, 16*256, { 1,  1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  8, 16*256, { 1,  1}, {1, 1}));
+    }
+
+    // rocmf custom quantized types (ROCm native tensor-core paths): MUL_MAT regression +
+    // WMMA verification. CPU reference via dequant (to_float); GPU via int8/i4 WMMA MMQ + MMVQ.
+    for (ggml_type type_a : { GGML_TYPE_Q4_0_ROCMI4,
+                              GGML_TYPE_Q3_0_ROCMFPX, GGML_TYPE_Q6_0_ROCMFPX,
+                              GGML_TYPE_Q8_0_ROCMFPX, GGML_TYPE_Q2_0_ROCMFPX }) {
+        for (int i = 1; i < 10; ++i) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, i, 1*256, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 1, 16*256, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 8, 16*256, {1, 1}, {1, 1}));
+    }
+
+    // REAL model linear-layer shapes (MMQ large-m path, not covered by the m=16 block above).
+    // Qwen3-4B: hidden=2560, attn out=4096. These expose large-m MMQ bugs.
+    for (ggml_type type_a : { GGML_TYPE_Q2_0_ROCMFPX, GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_Q4_0_ROCMFP4_FAST }) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, 1,  2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, 32, 2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2560, 1,  4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2560, 64, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 9728, 1,  2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2560, 32, 9728, {1, 1}, {1, 1}));
     }
 
     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.

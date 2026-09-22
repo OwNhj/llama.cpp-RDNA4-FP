@@ -61,6 +61,8 @@ file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
 list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
+list(APPEND GGML_SOURCES_ROCM
+    "../../rocmfp4/rocmfp4_hip.cu")
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
@@ -111,6 +113,10 @@ endif()
 
 if (GGML_HIP_RCCL)
     add_compile_definitions(GGML_USE_NCCL) # RCCL has the same interface as NCCL.
+endif()
+
+if (GGML_HIP_ROCMI4_W4A4)
+    add_compile_definitions(GGML_ROCMI4_W4A4=1)
 endif()
 
 if (GGML_HIP_EXPORT_METRICS)

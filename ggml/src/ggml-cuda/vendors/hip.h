@@ -212,7 +212,7 @@
 #define CDNA // For the entire family
 #endif // defined(CDNA4) || defined(CDNA3) || defined(CDNA2) || defined(CDNA1)
 
-#if defined(__GFX12__)
+#if defined(__gfx1200__) || defined(__gfx1201__) || defined(__GFX12__)
 #define RDNA4
 #endif // defined(__GFX12__)
 

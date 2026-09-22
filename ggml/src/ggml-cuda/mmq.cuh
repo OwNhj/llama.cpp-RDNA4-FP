@@ -59,6 +59,14 @@ static_assert(sizeof(block_fp4_mmq)  == sizeof(block_q8_1_mmq),    "Unexpected b
 
 static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
     switch (type_x) {
+        case GGML_TYPE_Q4_0_ROCMFP4:
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+        case GGML_TYPE_Q4_0_ROCMI4:
+        case GGML_TYPE_Q3_0_ROCMFPX:
+        case GGML_TYPE_Q2_0_ROCMFPX:
+        case GGML_TYPE_Q6_0_ROCMFPX:
+        case GGML_TYPE_Q8_0_ROCMFPX:
+            return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
             return MMQ_Q8_1_DS_LAYOUT_D4;
@@ -127,6 +135,7 @@ enum ggml_cuda_mmq_sram_layout {
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K,
     GGML_CUDA_MMQ_SRAM_LAYOUT_FP4,   // MXFP4 and NVFP4 on Blackwell.
     GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4, // Generic NVFP4
+    GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4, // Native i4 W4A4 (gfx12): 4 int data + 2 float scale + 11 pad
 };
 
 static constexpr __host__ __device__ int ggml_cuda_mmq_get_sram_stride(ggml_cuda_mmq_sram_layout sram_layout) {
@@ -145,6 +154,11 @@ static constexpr __host__ __device__ int ggml_cuda_mmq_get_sram_stride(ggml_cuda
             return 2*MMQ_TILE_NE_K + 8                     + 4;
         case GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4:
             return 2*MMQ_TILE_NE_K + MMQ_TILE_NE_K/2       + 4;
+        case GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4:
+            // K=256: 256 nibbles (32 int) + 8 scale + 4 pad. The 4-int pad keeps
+            // stride % 8 == 4, the bank-conflict rule every other MMA x-tile row
+            // in this file follows (see the static_asserts below).
+            return 32 + 8 + 4;
         default:
             return -1;
     }
@@ -157,6 +171,7 @@ static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K)  % 8
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K)  % 8 == 4, "Wrong padding.");
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_FP4)   % 8 == 4, "Wrong padding.");
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4) % 8 == 4, "Wrong padding.");
+static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4) % 8 == 4, "Wrong padding.");
 
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_FP4) == ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1), "Wrong tile size for MXFP4");
 
@@ -405,6 +420,13 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_Q5_1:    return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_Q8_0:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_MXFP4:   return MMQ_DP4A_TXS_Q8_1;
+        case GGML_TYPE_Q4_0_ROCMFP4:    return MMQ_DP4A_TXS_Q8_0_16;
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+        case GGML_TYPE_Q4_0_ROCMI4:     return MMQ_DP4A_TXS_Q8_0;
+        case GGML_TYPE_Q3_0_ROCMFPX:
+        case GGML_TYPE_Q2_0_ROCMFPX:
+        case GGML_TYPE_Q6_0_ROCMFPX:    return MMQ_DP4A_TXS_Q8_0_16;
+        case GGML_TYPE_Q8_0_ROCMFPX:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_NVFP4:   return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_Q2_K:    return MMQ_DP4A_TXS_Q2_K;
         case GGML_TYPE_Q3_K:    return MMQ_DP4A_TXS_Q3_K;
@@ -433,6 +455,27 @@ static __host__ int ggml_cuda_mmq_get_nbytes_shared_x(const ggml_cuda_mmq_config
 }
 
 // ------------------------------------------------------------
+
+
+#if GGML_ROCMI4_W4A4
+// gfx12 (RDNA4) native IU4 warp-MMA: D(16x16 i32) += A(16x32 i4) * B(16x32 i4)^T
+// Per-thread slices (verified with a random 16x16x32 matmul unit test on gfx1201):
+//   A/B: row = lane % 16, K = (lane / 16)*16 + half*8 + nibble
+//   D:   col = lane % 16, row = (lane / 16)*8 + l (l = 0..7)
+// Signed operands, exact i32 accumulation (no scale factors).
+using int32x2_t = __attribute__((__vector_size__(2 * sizeof(int32_t)))) int32_t;
+using int32x8_t = __attribute__((__vector_size__(8 * sizeof(int32_t)))) int32_t;
+
+template <bool a_signed, bool b_signed>
+static __device__ __forceinline__ void mma_iu4_gfx12(int32x8_t & D, const int32x2_t & A, const int32x2_t & B) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+    D = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(a_signed, A, b_signed, B, D, false);
+#else
+    GGML_UNUSED_VARS(D, A, B);
+    NO_DEVICE_CODE;
+#endif
+}
+#endif // GGML_ROCMI4_W4A4
 
 #include "mmq-load-tiles.cuh"
 #include "mmq-vec-dot.cuh"
@@ -667,6 +710,42 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     ggml_cuda_mmq_load_tiles_iq4_nl<type, J, fallback>,
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+            case GGML_TYPE_Q4_0_ROCMFP4:
+                return ggml_cuda_mmq_util_funcs(
+                    VDR_ROCMFP4_Q8_1_MMQ,
+                    ggml_cuda_mmq_load_tiles_rocmfp4<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+            case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+                return ggml_cuda_mmq_util_funcs(
+                    VDR_ROCMFP4_FAST_Q8_1_MMQ,
+                    ggml_cuda_mmq_load_tiles_rocmfp4_fast<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+            case GGML_TYPE_Q3_0_ROCMFPX:
+                return ggml_cuda_mmq_util_funcs(
+                    VDR_ROCMFP3_Q8_1_MMQ,
+                    ggml_cuda_mmq_load_tiles_rocmfpx_fp3<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+            case GGML_TYPE_Q2_0_ROCMFPX:
+                return ggml_cuda_mmq_util_funcs(
+                    VDR_ROCMFP2_Q8_1_MMQ,
+                    ggml_cuda_mmq_load_tiles_rocmfpx_fp2<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+            case GGML_TYPE_Q6_0_ROCMFPX:
+                return ggml_cuda_mmq_util_funcs(
+                    VDR_ROCMFP6_Q8_1_MMQ,
+                    ggml_cuda_mmq_load_tiles_rocmfpx_fp6<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+            case GGML_TYPE_Q8_0_ROCMFPX:
+                return ggml_cuda_mmq_util_funcs(
+                    VDR_ROCMFP8_Q8_1_MMQ,
+                    ggml_cuda_mmq_load_tiles_rocmfpx_fp8<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
 // ---------------------------------------------------------------------------------------------
             case GGML_TYPE_MXFP4:
                 return ggml_cuda_mmq_util_funcs(
@@ -852,6 +931,21 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 ggml_cuda_mmq_load_tiles_mxfp8<type, J, fallback>,
                 ggml_cuda_mmq_vec_dot_fp8_mma<type, J, fallback, /*x_scale_ints=*/8>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
+        case GGML_TYPE_Q4_0_ROCMI4:
+#if GGML_ROCMI4_W4A4 && defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+            // Native i4 tensor core (lossy activation grid); J % 16 == 0 only.
+            return ggml_cuda_mmq_util_funcs(
+                -1,
+                ggml_cuda_mmq_load_tiles_rocmi4_w4a4<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_rocmi4_w4a4<type, J, fallback>,
+                ggml_cuda_mmq_write_back_rocmi4_w4a4<type, J, fallback>);
+#else
+            return ggml_cuda_mmq_util_funcs(
+                -1,
+                ggml_cuda_mmq_load_tiles_rocmi4<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback>);
+#endif
         default:
             return ggml_cuda_mmq_util_funcs(1, nullptr, nullptr, nullptr);
     }
@@ -1601,6 +1695,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ3_XXS);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ3_S);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ4_NL);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
+extern DECL_MMQ_CASE(GGML_TYPE_Q4_0_ROCMI4);
 // -----------------------------------------
 extern DECL_MMQ_CASE(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
