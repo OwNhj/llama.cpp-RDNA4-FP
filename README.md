@@ -101,7 +101,13 @@
 > | `MXFP4` | 4.36 | 13.87 GiB | 4.3262 |
 > | `Q8_0` | 4.60 | 14.62 GiB | 4.4551 |
 >
-> MXFP4 costs the least size and scores best. The root cause is not yet understood: the stored
+> The damage scales with how many `ssm_out` tensors stay in ROCMI4 rather than coming from one
+> bad tensor, which fits the tensor feeding the SSM/gated-delta recurrence: a small per-layer
+> error enters a state carried across layers and tokens and compounds instead of washing out.
+> Pinning the first 24 of 48 layers to MXFP4 gives 274.2766, all 48 left in ROCMI4 gives
+> 429951, and all 48 pinned gives 4.3262.
+>
+> The root cause is not yet understood: the stored
 > `ssm_out` values are no less accurate than MXFP4's (NMSE 1.08e-2 against 1.31e-2 on the bf16
 > source), the standalone dot product is exact, and the failure reproduces bit-for-bit across
 > backends that use different activation precisions. Treat it as a known limitation of the
