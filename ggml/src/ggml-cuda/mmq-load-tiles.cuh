@@ -1723,13 +1723,13 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbx;
 
         const int aux  = get_int_b1(bxi->qs, kqsx); // 8 e2m1 nibbles (4 bytes)
-        uint32_t lo = 0, hi = 0;
-#pragma unroll
-        for (int n = 0; n < 4; ++n) {
-            // byte n of the 4: low nibble -> element, high nibble -> element + qk/2
-            lo |= (uint32_t) ggml_cuda_e2m1_to_e4m3((aux >> (8*n))     & 0xF) << (8*n);
-            hi |= (uint32_t) ggml_cuda_e2m1_to_e4m3((aux >> (8*n + 4)) & 0xF) << (8*n);
-        }
+        // One byte-permute lookup handles all 8 nibbles at once: get_int_from_table_16 returns
+        // the low-nibble bytes in .x and the high-nibble bytes in .y, which is exactly the
+        // lo/hi split the tile layout below expects. The scalar form cost 8 constant loads and
+        // 8 shifts per thread; this matches what the int8 MXFP4 and NVFP4 loaders already do.
+        const int2 vv = get_int_from_table_16(aux, (const int8_t *) ggml_cuda_e2m1_to_e4m3_lut);
+        const uint32_t lo = (uint32_t) vv.x;
+        const uint32_t hi = (uint32_t) vv.y;
         // CPU nibble order (dequantize_row_mxfp4): within each 32-elem block, low nibble of
         // byte j -> element j, high nibble -> element j+16. So per block the e4m3 tile bytes
         // 0..15 hold all low nibbles and bytes 16..31 all high nibbles: lo -> int kqsx,
