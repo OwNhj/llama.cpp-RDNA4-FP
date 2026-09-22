@@ -32,6 +32,97 @@
 >
 > MXFP8 weights are produced with `./build/bin/llama-quantize in.gguf out.gguf MXFP8`, or directly
 > from a Hugging Face model with `python3 convert_hf_to_gguf.py --outtype mxfp8 --outfile out.gguf <model_dir>`.
+>
+> ### RDNA4 I4 W4A4 (weight 4-bit x activation 4-bit)
+>
+> `Q4_0_ROCMI4` is a signed-nibble 4-bit format with a one-byte UE4M3 block scale
+> (32 elements per block, 4.25 bpw). On RDNA4 it has two compute paths:
+>
+> * **W4A4 (prefill)** — weights stay packed as nibbles in LDS and are consumed by the native
+>   `v_wmma_i32_16x16x32_iu4` tensor-core instruction (K = 32 in a single op). Activations are
+>   quantized onto a signed 4-bit grid. Requires `-DGGML_HIP_ROCMI4_W4A4=ON`.
+> * **W8A8 (decode)** — the MMVQ path decodes nibbles to int8 and pairs them with q8_1
+>   activations, so decode keeps 8-bit activation precision. This is the default and is not
+>   affected by the build option above: at batch sizes up to 8 the activations stay q8_1, and
+>   only larger batches take the W4A4 path.
+>
+> Enable W4A4 at configure time:
+>
+> ```bash
+> cmake -B build-gpu -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1201 -DCMAKE_BUILD_TYPE=Release \
+>       -DGGML_HIP_ROCMI4_W4A4=ON
+> cmake --build build-gpu -j
+> ```
+>
+> Quantize with the `Q4_0_ROCMI4` ftype; it reuses the Q4_0 per-tensor assignment, so the same
+> tensors are promoted to Q6_K and the resulting file size matches Q4_0's layout:
+>
+> ```bash
+> ./build-gpu/bin/llama-quantize model-bf16.gguf model-rocmi4.gguf Q4_0_ROCMI4
+> ```
+>
+> **W4A4 is deliberately lossy on the activation side.** Prefill quantizes activations to a
+> 4-bit grid (16 uniform levels) instead of the q8_1 used everywhere else, so a file built with
+> W4A4 enabled scores worse than the same file built with `-DGGML_HIP_ROCMI4_W4A4=OFF`. Measured
+> on Qwen3.8-27B, single R9700, `-c 512`:
+>
+> | file | PPL |
+> |---|---|
+> | `Q4_0` (reference) | 3.7755 |
+> | `Q4_0_ROCMI4`, W4A4 off | 4.6937 |
+> | `Q4_0_ROCMI4`, W4A4 on | 5.4493 |
+>
+> The same pattern shows up in decode without any build-flag change, because that is the same
+> trade-off reached from the other side: forcing a batch size of 1 puts prefill through the
+> q8_1 activation path and the same file then measures 4.7064.
+>
+> For prefill throughput on a 1B dense model, single R9700, `-p 2048 -r 5`: `Q4_0` 25 049 t/s
+> against `Q4_0_ROCMI4` with W4A4 on at 29 588 t/s, i.e. about +18%, and roughly +14.5% at the
+> tile configuration shipped before the final one. These are dense-transformer numbers; the
+> 27B figures measured later mix in SSM layers and are not directly comparable.
+>
+> **Do not quantize `ssm_out` to `Q4_0_ROCMI4`.** On hybrid SSM/attention architectures such as
+> Qwen3.8-27B, `ssm_out.weight` must be left at another type. Putting it in ROCMI4 drives
+> perplexity to ~4.3e5 while every other tensor in the same file stays correct, and it does so
+> identically on CPU and on GPU, so it is not a kernel defect. Pin those tensors to Q8_0 or
+> MXFP4 instead:
+>
+> ```bash
+> # one line per layer: blk.N.ssm_out.weight=q8_0
+> ./build-gpu/bin/llama-quantize --tensor-type-file ssm_out.txt \
+>     model-bf16.gguf model-rocmi4.gguf Q4_0_ROCMI4
+> ```
+>
+> Both workarounds were measured on Qwen3.8-27B, single R9700, `-c 512`:
+>
+> | `ssm_out` type | bpw | size | PPL |
+> |---|---|---|---|
+> | `Q4_0_ROCMI4` | 4.25 | 13.88 GiB | 429951 (broken) |
+> | `MXFP4` | 4.36 | 13.87 GiB | 4.3262 |
+> | `Q8_0` | 4.60 | 14.62 GiB | 4.4551 |
+>
+> MXFP4 costs the least size and scores best. The root cause is not yet understood: the stored
+> `ssm_out` values are no less accurate than MXFP4's (NMSE 1.08e-2 against 1.31e-2 on the bf16
+> source), the standalone dot product is exact, and the failure reproduces bit-for-bit across
+> backends that use different activation precisions. Treat it as a known limitation of the
+> current ROCMI4 support rather than a property of the format.
+>
+> ### Attribution
+>
+> The I4 W4A4 path and the `Q4_0_ROCMI4` format are ported from
+> [ROCmFPX](https://github.com/charlie12345/ROCmFPX), which targets RDNA3.5
+> (gfx1151). Porting it into this tree meant re-adapting it to the current upstream MMQ
+> generation: ROCmFPX is written against an older MMQ built on `mmq_type_traits` with a runtime
+> `ncols_dst`, while upstream now selects on compile-time `ncols_dst` templates and routes
+> through `calc_nwarps` / `calc_rows_per_block`. The loader, the byte-interleaved nibble
+> packing, the LDS stride, the `vec_dot` and the per-tile configuration were all re-derived for
+> that structure. RDNA4 also has the K = 32 form of the instruction, so a single
+> `v_wmma_i32_16x16x32_iu4` is issued where ROCmFPX calls the K = 16 form twice.
+>
+> The ROCmFP4 / ROCmFPx family that the ROCmFPX port originally brought along (Q4_0_ROCMFP4,
+> Q4_0_ROCMFP4_FAST, Q3_0/Q2_0/Q6_0/Q8_0_ROCMFPX) has been removed: none of it is used by the
+> W4A4 work and its MMVQ paths were incomplete here.
+>
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
