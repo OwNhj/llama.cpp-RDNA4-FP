@@ -1009,6 +1009,15 @@ static __device__ __forceinline__ half2 ggml_cuda_e4m3x2_to_half2(const uint8_t 
 #endif
 }
 
+// The 16 e2m1 codes (sign | e<<1 | m) in their exact e4m3 encoding. A single 16-byte table carries
+// sign, exponent and mantissa at once, turning the per-nibble conversion into one byte lookup --
+// the previous branch-on-exponent form cost several shifts, masks and a divergent select per
+// nibble, which dominated the MXFP4 fp8 tile loader (see design.md 4.7.3f).
+__device__ __constant__ uint8_t ggml_cuda_e2m1_to_e4m3_lut[16] = {
+    0x00, 0x30, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C,   // +0, +0.5, +1, +1.5, +2, +3, +4, +6
+    0x80, 0xB0, 0xB8, 0xBC, 0xC0, 0xC4, 0xC8, 0xCC,   // the same magnitudes, negated
+};
+
 // Exact e2m1 (OCP FP4, 4-bit) -> e4m3 (FP8, 8-bit) expansion.
 // The 8 e2m1 magnitudes {0, 0.5, 1, 1.5, 2, 3, 4, 6} are all exactly representable in e4m3
 // (mantissas 1.0 / 1.5, wide enough exponent range), so MXFP4 / NVFP4 weights can be fed to the
@@ -1017,17 +1026,7 @@ static __device__ __forceinline__ half2 ggml_cuda_e4m3x2_to_half2(const uint8_t 
 // ggml_ue4m3_to_fp32 = value*0.5) so the net value is the standard e2m1 * scale; emitting raw
 // e2m1 here (raw scale on the GPU) is consistent with that.
 static __device__ __forceinline__ uint8_t ggml_cuda_e2m1_to_e4m3(uint8_t c) {
-    const uint32_t s = (c >> 3) & 1;
-    const uint32_t e = (c >> 1) & 3;
-    const uint32_t m = c & 1;
-    // magnitude: e=0 -> {0, 0.5}; e>=1 -> (1 + m/2) * 2^(e-1)
-    uint32_t mag;
-    if (e == 0) {
-        mag = m ? 0x30u /* 0.5 */ : 0x00u /* 0   */;
-    } else {
-        mag = ((e + 6) << 3) | (m << 2); // E = e-1+7 = e+6, mantissa 1.0 (m=0) or 1.5 (m=1)
-    }
-    return (uint8_t) ((s ? mag | 0x80u : mag) & 0xFFu);
+    return ggml_cuda_e2m1_to_e4m3_lut[c & 0xF];
 }
 
 // E4M3FN (OCP) saturating round-to-nearest-even f32 -> e4m3 encoder.
