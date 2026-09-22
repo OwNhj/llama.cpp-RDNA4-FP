@@ -2,7 +2,7 @@
 
 > **This fork** is based on upstream `master` and adds RDNA4 (gfx12) FP8 support on top of it:
 > an **F8 (E4M3) KV cache** with its own flash-attention kernels, **F8 WMMA** compute, and
-> **MXFP8** weight quantization. See [design.md](design.md) for details.
+> **MXFP8** weight quantization.
 >
 > MXFP4 / NVFP4 weights also run through FP8 compute instead of the int8 WMMA path: their e2m1
 > values are expanded to e4m3 exactly (every e2m1 magnitude is representable in e4m3), and the
