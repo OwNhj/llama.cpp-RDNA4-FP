@@ -1,5 +1,38 @@
 # llama.cpp
 
+> **This fork** is based on upstream `master` and adds RDNA4 (gfx12) FP8 support on top of it:
+> an **F8 (E4M3) KV cache** with its own flash-attention kernels, **F8 WMMA** compute, and
+> **MXFP8** weight quantization. See [design.md](design.md) for details.
+>
+> MXFP4 / NVFP4 weights also run through FP8 compute instead of the int8 WMMA path: their e2m1
+> values are expanded to e4m3 exactly (every e2m1 magnitude is representable in e4m3), and the
+> prefill GEMM then uses the FP8 WMMA path with the E8M0 / UE4M3 scales stored raw.
+>
+> ### Building with the F8 KV cache
+>
+> The F8 flash-attention K-V combinations are **not** in the default `GGML_CUDA_FA_QUANTS` list and
+> have to be enabled explicitly. Without them `-ctk f8` still works, but token generation falls back
+> to converting K and V to f16 before running the f16 vector kernel (slower, with a warning); the
+> prefill path is unaffected either way, since it dequantizes F8 to f16 and uses the f16 matrix
+> kernel:
+>
+> ```bash
+> cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1201 -DCMAKE_BUILD_TYPE=Release \
+>       -DGGML_CUDA_FA_QUANTS="q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16;f8-f8;f8-f16;f16-f8"
+> cmake --build build -j
+> ```
+>
+> Then enable it at runtime with `-ctk f8 -ctv f8`:
+>
+> ```bash
+> ./build/bin/llama-cli       -m model.gguf -ngl 99 -ctk f8 -ctv f8 -p "Hello"
+> ./build/bin/llama-server    -m model.gguf -ngl 99 -ctk f8 -ctv f8
+> ./build/bin/llama-perplexity -m model.gguf -ngl 99 -ctk f8 -ctv f8 -f wiki.test.raw
+> ```
+>
+> MXFP8 weights are produced with `./build/bin/llama-quantize in.gguf out.gguf MXFP8`, or directly
+> from a Hugging Face model with `python3 convert_hf_to_gguf.py --outtype mxfp8 --outfile out.gguf <model_dir>`.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
