@@ -427,12 +427,13 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
     return return_type;
 }
 
+// Defined further down; declared here so the mirror helpers below can use it.
+ggml_type llama_ftype_get_default_type(llama_ftype ftype);
+
 // MXFP4 / NVFP4 reuse Q4_0's per-tensor assignment and MXFP8 reuses Q8_0's, mirroring whichever Q
 // ftype has the closest bit width (4.25/4.5 bpw -> Q4_0 at 4.5, 8.25 bpw -> Q8_0 at 8.5). Without
 // this the FP ftypes keep every tensor at their native width, leaving e.g. the output tensor
 // un-promoted where every other ftype promotes it to Q6_K.
-ggml_type llama_ftype_get_default_type(llama_ftype ftype);
-
 static llama_ftype fp_ftype_mirror(llama_ftype ftype) {
     switch (ftype) {
         case LLAMA_FTYPE_MOSTLY_MXFP4:
@@ -476,6 +477,10 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
     // those tests and promote tensors the Q path leaves alone.
     const llama_ftype mirror = fp_ftype_mirror(ftype);
     if (mirror != ftype) {
+        // The mirror runs with its own block size -- 32 for both Q4_0 and Q8_0, versus 256 for
+        // MXFP8 and 64 for NVFP4. Shape checks inside therefore pass on the mirror's granularity;
+        // tensor_type_fallback re-checks against the real target afterwards, so a shape that is
+        // incompatible with the FP type still lands on a valid one.
         const ggml_type fp_type   = new_type;
         const ggml_type mirror_ty = llama_ftype_get_default_type(mirror);
         const ggml_type mirrored  = llama_tensor_get_type_impl(qs, mirror_ty, tensor, mirror, category);
