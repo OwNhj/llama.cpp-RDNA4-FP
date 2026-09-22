@@ -70,6 +70,39 @@ void quantize_row_f8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int6
     quantize_row_f8_ref(x, (block_f8 *) y, k);
 }
 
+// F8 x f16 dot product, used by the CPU flash-attention path: its K side has to go through a
+// vec_dot (unlike V, which uses to_float), so a KV type without one makes FA abort. Decoding the
+// e4m3 quants to f16 and reusing the f16 dot keeps this consistent with the GPU side, where F8
+// attention also runs through the f16 kernel.
+void ggml_vec_dot_f8_f16(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_F8 == 0);
+
+    const block_f8 * GGML_RESTRICT x = vx;
+    const ggml_fp16_t * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_F8;
+
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[ib].d);
+
+        for (int j = 0; j < QK_F8; ++j) {
+            const uint8_t q = x[ib].qs[j];
+            // same decode as dequantize_row_f8: sign * kvalues_mxfp8[q & 0x7F] / 512 * d
+            const float xv = ((q & 0x80) ? -1.0f : 1.0f) * (float) kvalues_mxfp8[q & 0x7F] * (1.0f / 512.0f) * d;
+            sumf += xv * GGML_CPU_FP16_TO_FP32(y[ib * QK_F8 + j]);
+        }
+    }
+
+    *s = sumf;
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //

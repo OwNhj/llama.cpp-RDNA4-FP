@@ -10729,10 +10729,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
+    // F8 is included: it is the e4m3 KV-cache type (head sizes 64/96/128/256 are multiples of its
+    // 32-element block), and these shapes exercise the matrix path where F8 K/V are dequantized to
+    // f16 before the f16 flash-attention kernel runs.
     for (int kv : { 1024, 2048, }) {
         for (int hs : { 64, 128, 256, }) {
             for (int nb : { 32, 64, }) {
-                for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, }) {
+                for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_F8, }) {
                     test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
                 }
             }
@@ -10820,6 +10823,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 2},  1025,   1, true, true,  8, 30, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1025,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+
+    // F8 (e4m3) KV cache, mirroring the q8_0 shapes above. nb=1 exercises the decode-shaped
+    // vector kernel; the larger nb cases take the matrix kernel.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  256, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8, GGML_TYPE_F8));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8, GGML_TYPE_F8));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 1024, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8, GGML_TYPE_F8));
+    test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 4, {1, 1},  512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8, GGML_TYPE_F8));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 1024, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8, GGML_TYPE_F8));
+    test_cases.emplace_back(new test_flash_attn_ext( 96,  96, 4, {1, 1},  512, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8, GGML_TYPE_F8));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1}, 4096, 8, true,  true, 0, 0, GGML_PREC_F32, GGML_TYPE_F8, GGML_TYPE_F8));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  512, 2, true, false, 8, 30, GGML_PREC_F32, GGML_TYPE_F8, GGML_TYPE_F8));
 
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));

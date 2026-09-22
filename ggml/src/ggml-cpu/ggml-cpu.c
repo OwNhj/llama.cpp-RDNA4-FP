@@ -302,8 +302,13 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+    // F8 is a KV-cache-only type: no matmul weights, but the CPU flash-attention kernel needs a
+    // vec_dot for its K side (V goes through to_float). Q stays f16, mirroring the GPU side where
+    // F8 attention also runs through the f16 kernel.
     [GGML_TYPE_F8] = {
         .from_float               = quantize_row_f8,
+        .vec_dot                  = ggml_vec_dot_f8_f16,
+        .vec_dot_type             = GGML_TYPE_F16,
         .nrows                    = 1,
     },
     [GGML_TYPE_Q2_K] = {
