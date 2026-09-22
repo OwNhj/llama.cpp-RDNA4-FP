@@ -427,9 +427,60 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
     return return_type;
 }
 
+// MXFP4 / NVFP4 reuse Q4_0's per-tensor assignment and MXFP8 reuses Q8_0's, mirroring whichever Q
+// ftype has the closest bit width (4.25/4.5 bpw -> Q4_0 at 4.5, 8.25 bpw -> Q8_0 at 8.5). Without
+// this the FP ftypes keep every tensor at their native width, leaving e.g. the output tensor
+// un-promoted where every other ftype promotes it to Q6_K.
+ggml_type llama_ftype_get_default_type(llama_ftype ftype);
+
+static llama_ftype fp_ftype_mirror(llama_ftype ftype) {
+    switch (ftype) {
+        case LLAMA_FTYPE_MOSTLY_MXFP4:
+        case LLAMA_FTYPE_MOSTLY_NVFP4:
+            return LLAMA_FTYPE_MOSTLY_Q4_0;
+        case LLAMA_FTYPE_MOSTLY_MXFP8:
+            return LLAMA_FTYPE_MOSTLY_Q8_0;
+        default:
+            return ftype;
+    }
+}
+
+// Map a type from the mirror decision back onto the FP format: the plain 4/5-bit types become the
+// FP type itself, while anything the Q path promoted (Q6_K for output, Q8_0, F16, ...) is kept.
+static ggml_type fp_type_from_mirror(ggml_type t, ggml_type fp_type) {
+    // Each mirror type maps back to the FP format only when it really is that format's counterpart.
+    // Q8_0 is the mirror of MXFP8 and Q4_0 that of MXFP4/NVFP4; a mirrored Q4_0 seen while
+    // quantizing MXFP8 means the Q8_0 path demoted the tensor, so it must stay a Q type.
+    switch (t) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+            return (fp_type == GGML_TYPE_MXFP4 || fp_type == GGML_TYPE_NVFP4) ? fp_type : t;
+        case GGML_TYPE_Q8_0:
+            return (fp_type == GGML_TYPE_MXFP8) ? fp_type : t;
+        default:
+            return t;
+    }
+}
+
 // internal standard logic for selecting the target tensor type based on tensor category, ftype, and model arch
 static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type new_type, const ggml_tensor * tensor, llama_ftype ftype, tensor_category category) {
     const std::string name = ggml_get_name(tensor);
+
+    // Reuse the Q4_0 / Q8_0 assignment for the FP ftypes, then translate the answer back. The
+    // mirror gets the mirror's own base type: the branches below compare new_type against Q types
+    // (e.g. "new_type != GGML_TYPE_Q8_0"), so passing the FP type would take the wrong side of
+    // those tests and promote tensors the Q path leaves alone.
+    const llama_ftype mirror = fp_ftype_mirror(ftype);
+    if (mirror != ftype) {
+        const ggml_type fp_type   = new_type;
+        const ggml_type mirror_ty = llama_ftype_get_default_type(mirror);
+        const ggml_type mirrored  = llama_tensor_get_type_impl(qs, mirror_ty, tensor, mirror, category);
+        return fp_type_from_mirror(mirrored, fp_type);
+    }
 
     // TODO: avoid hardcoded tensor names - use the TN_* constants
     const llm_arch arch = qs.model.arch;
@@ -474,10 +525,7 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                      ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
                 new_type = GGML_TYPE_Q5_K;
             }
-            else if (new_type != GGML_TYPE_Q8_0 && ftype != LLAMA_FTYPE_MOSTLY_MXFP8 &&
-                     ftype != LLAMA_FTYPE_MOSTLY_MXFP4 && ftype != LLAMA_FTYPE_MOSTLY_NVFP4) {
-                // MXFP8 (8.25 bpw), dense MXFP4 (4.5 bpw) and NVFP4 (4.25 bpw) keep all tensors,
-                // including the output, in their native type
+            else if (new_type != GGML_TYPE_Q8_0) {
                 new_type = GGML_TYPE_Q6_K;
             }
         }
