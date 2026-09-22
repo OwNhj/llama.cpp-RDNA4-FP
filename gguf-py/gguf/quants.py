@@ -427,53 +427,6 @@ def _rocmfpx_unpack_codes(qs: np.ndarray, nbits: int, block_size: int) -> np.nda
     return ((words >> bit_index) & np.uint16((1 << nbits) - 1)).astype(np.uint8)
 
 
-class Q3_0_ROCMFPX(__Quant, qtype=GGMLQuantizationType.Q3_0_ROCMFPX):
-    _mag = np.array((0, 1, 2, 4), dtype=np.int8)
-
-    @classmethod
-    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
-        n_blocks = blocks.shape[0]
-
-        qs, e = np.hsplit(blocks, [12])
-
-        codes = _rocmfpx_unpack_codes(qs, 3, cls.block_size)
-        mag = np.take(cls._mag, codes & np.uint8(3))
-        vals = np.where((codes & np.uint8(4)) != 0, -mag, mag).astype(np.float32)
-
-        scales = _rocmfpx_ue4m3_to_fp32(e).reshape(n_blocks, 2, 1)
-        vals = vals.reshape(n_blocks, 2, cls.block_size // 2)
-
-        return (vals * scales).reshape(n_blocks, cls.block_size)
-
-
-class Q6_0_ROCMFPX(__Quant, qtype=GGMLQuantizationType.Q6_0_ROCMFPX):
-    @classmethod
-    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
-        n_blocks = blocks.shape[0]
-
-        qs, e = np.hsplit(blocks, [24])
-
-        codes = _rocmfpx_unpack_codes(qs, 6, cls.block_size)
-        mag = (codes & np.uint8(31)).astype(np.int8)
-        vals = np.where((codes & np.uint8(32)) != 0, -mag, mag).astype(np.float32)
-
-        scales = _rocmfpx_ue4m3_to_fp32(e).reshape(n_blocks, 2, 1)
-        vals = vals.reshape(n_blocks, 2, cls.block_size // 2)
-
-        return (vals * scales).reshape(n_blocks, cls.block_size)
-
-
-class Q8_0_ROCMFPX(__Quant, qtype=GGMLQuantizationType.Q8_0_ROCMFPX):
-    @classmethod
-    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
-        qs, e = np.hsplit(blocks, [32])
-
-        scales = _rocmfpx_ue4m3_to_fp32(e)
-        qs = qs.view(np.int8).astype(np.float32)
-
-        return qs * scales
-
-
 class Q4_0_ROCMI4(__Quant, qtype=GGMLQuantizationType.Q4_0_ROCMI4):
     @classmethod
     def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
