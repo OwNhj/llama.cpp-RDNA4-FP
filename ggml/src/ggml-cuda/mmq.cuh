@@ -875,10 +875,19 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 ggml_cuda_mmq_vec_dot_fp8_mma<type, J, fallback, /*x_scale_ints=*/8>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
         case GGML_TYPE_NVFP4:
+            // Back on the mainline int8 WMMA path (q8_0_16). NVFP4 keeps one UE4M3 scale per 16
+            // elements, so its fp8 tile has to be 4 ints wide while MXFP4's 32-element scale
+            // allows 8. The WMMA count is the same either way (4 trips x 2 calls vs 8 trips x 1),
+            // so the narrower tile only costs extra ldmatrix loads and loop overhead -- and a
+            // kernel profile measured 165.6 ms for the NVFP4 prefill kernel against 90.3 ms for
+            // MXFP4's, with every other kernel matching. The int8 path uses the same 4-int tile
+            // and the same 16-element scale without that difference, so it is the better choice
+            // here. It needs q8_1 int8 y, which mmq.cu arranges by excluding NVFP4 from the
+            // RDNA4 e4m3 y branch.
             return ggml_cuda_mmq_util_funcs(
                 -1,
-                ggml_cuda_mmq_load_tiles_nvfp4_fp8<type, J, fallback>,
-                ggml_cuda_mmq_vec_dot_fp8_mma<type, J, fallback, /*x_scale_ints=*/4, /*x_tile_ints=*/4>,
+                ggml_cuda_mmq_load_tiles_nvfp4<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
         case GGML_TYPE_MXFP8:
             return ggml_cuda_mmq_util_funcs(

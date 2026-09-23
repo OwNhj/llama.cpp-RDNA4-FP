@@ -162,10 +162,12 @@ void ggml_cuda_mul_mat_q(
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
-            } else if ((src0->type == GGML_TYPE_MXFP8 || src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4)
+            } else if ((src0->type == GGML_TYPE_MXFP8 || src0->type == GGML_TYPE_MXFP4)
                        && GGML_CUDA_CC_IS_RDNA4(cc)) {
-                // e4m3 y tiles for the W8A8 fp8 WMMA path (RDNA4 only); other archs fall through
-                // to the q8_1 int8 y consumed by the mainline int8 vec_dots.
+                // e4m3 y tiles for the W8A8 fp8 WMMA path (RDNA4 only). NVFP4 is deliberately
+                // NOT here: its MMQ vec_dot is the mainline int8 one (q8_0_16), which consumes
+                // q8_1 int8 y. Producing e4m3 y while running an int8 vec_dot feeds int8 code
+                // e4m3 bytes and corrupts the result, so the two choices have to move together.
                 quantize_mmq_mxfp8_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             } else {

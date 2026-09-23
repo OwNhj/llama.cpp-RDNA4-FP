@@ -4,9 +4,20 @@
 > an **F8 (E4M3) KV cache** with its own flash-attention kernels, **F8 WMMA** compute, and
 > **MXFP8** weight quantization.
 >
-> MXFP4 / NVFP4 weights also run through FP8 compute instead of the int8 WMMA path: their e2m1
-> values are expanded to e4m3 exactly (every e2m1 magnitude is representable in e4m3), and the
-> prefill GEMM then uses the FP8 WMMA path with the E8M0 / UE4M3 scales stored raw.
+> **MXFP4** weights run through FP8 compute instead of the int8 WMMA path: their e2m1 values are
+> expanded to e4m3 exactly (every e2m1 magnitude is representable in e4m3), and the prefill GEMM
+> then uses the FP8 WMMA path with the E8M0 scales stored raw.
+>
+> **NVFP4 stays on the int8 WMMA path.** It keeps one UE4M3 scale per 16 elements rather than
+> MXFP4's one per 32, so its FP8 k-tile has to be 4 ints wide where MXFP4's is 8. The WMMA count
+> is the same either way (8 trips x 1 call vs 4 trips x 2), so the narrower tile only buys extra
+> `ldmatrix` loads and loop overhead: a kernel profile measured 165.6 ms for the NVFP4 prefill
+> kernel against 90.3 ms for MXFP4's, with every other kernel matching. The int8 path uses the
+> same 4-int tile and the same 16-element scale, and it also clears four `test-backend-ops`
+> MUL_MAT failures the FP8 path had. It is about 9% slower on prefill than the FP8 path was
+> (20.3k vs 22.3k t/s at `-p 2048`), but it is correct on every case, so correctness wins here.
+> Note that the two halves of this decision have to move together: NVFP4 is excluded from the
+> RDNA4 e4m3-y branch in `mmq.cu` because an int8 vec_dot must consume q8_1 int8 y, not e4m3.
 >
 > It also adds **`Q4_0_ROCMI4`**: a signed-nibble 4-bit format that runs as **W4A4** on the RDNA4
 > `v_wmma_i32_16x16x32_iu4` tensor core, ported from [ROCmFPX](https://github.com/charlie12345/ROCmFPX)
