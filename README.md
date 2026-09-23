@@ -223,6 +223,32 @@ Note the two mechanisms at work: `--token-embedding-type` sets `token_embd`, whi
 anchored on `.weight` to avoid also matching `attn_q_norm`, `attn_k_norm`, and the like.
 `ssm_out` must stay pinned to `Q8_0` (or MXFP4) exactly as for ROCMI4.
 
+### imatrix support
+
+`--imatrix` works for `Q4_0_SYM4`, matching `Q4_0_ROCMI4`. SYM4 has one free parameter per
+block (the UE4M3 scale) and the codes follow by rounding, so the weighted path searches for the
+scale that minimises the importance-weighted error instead of taking `amax/7.5`. Two constants
+differ from the ROCMI4 variant because SYM4's grid tops out at `7.5*s`: the search starts at
+`amax/7.5`, and the early-exit clipping bound uses 7.5.
+
+**A full imatrix is not necessarily the best choice, so tune it against KL rather than assuming
+it helps.** On Qwen3.8-27B the weighted path moved error from the typical token to the worst
+one: the average-weighted metrics all improved (Mean KLD −4.7%, 95% KLD −11.3%, 95% Δp −12.8%)
+while the 99th-percentile metrics got worse (99% Δp +10.8%, 99% KLD +3.8%). Which side of that
+trade matters depends on the use. Under llama.cpp's speculative decoding the accept test is
+whether the target's sampled token equals the draft's proposal, so what counts is agreement on
+the top of the distribution — `Same top-p` and `99% Δp` — rather than `Mean KLD`, which averages
+over the whole 248k-token vocabulary. For a draft model the 99% figures are the ones to watch.
+
+No single tensor class causes the tail cost, and masking one does not recover it: removing the
+imatrix entries for a class makes that tensor fall back to the unweighted quantiser (the loader
+leaves the pointer NULL when a name is missing), and doing so for `attn_v` + `attn_qkv`,
+`ffn_down`, `ffn_gate`, or `ffn_up` each made 99% Δp *worse* than the full imatrix. The
+tail cost is a property of the weighted objective, not of any one class. Note also that
+`ffn_up` scored the best `Same top-p` while having a poor 99% Δp, so those two metrics can
+disagree — measure both, and do not trust differences below about 1pp, since these were single
+runs whose spread has not been characterised.
+
 ### Cost
 
 None measurable. On the tuned file, single R9700, `-p 512 -n 128 -r 3`:
