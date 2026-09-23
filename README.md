@@ -86,7 +86,7 @@ against `Q4_0_ROCMI4` with W4A4 on at 29 588 t/s, i.e. about +18%, and roughly +
 tile configuration shipped before the final one. These are dense-transformer numbers; the
 27B figures measured later mix in SSM layers and are not directly comparable.
 
-**Do not quantize `ssm_out` to `Q4_0_ROCMI4`.** On hybrid SSM/attention architectures such as
+**Do not quantize `ssm_out` to `Q4_0_ROCMI4`.** (The same applies to `Q4_0_SYM4`; see the section below.) On hybrid SSM/attention architectures such as
 Qwen3.8-27B, `ssm_out.weight` must be left at another type. Putting it in ROCMI4 drives
 perplexity to ~4.3e5 while every other tensor in the same file stays correct, and it does so
 identically on CPU and on GPU, so it is not a kernel defect. Pin those tensors to Q8_0 or
@@ -117,6 +117,133 @@ The root cause is not yet understood: the stored
 source), the standalone dot product is exact, and the failure reproduces bit-for-bit across
 backends that use different activation precisions. Treat it as a known limitation of the
 current ROCMI4 support rather than a property of the format.
+
+## Q4_0_SYM4 — experimental symmetric 4-bit format
+
+**`Q4_0_SYM4` is experimental. It is not a general-purpose replacement for `Q4_0_ROCMI4`, and
+like ROCMI4 it must not be used for `ssm_out` tensors.** See the tuning rules below: used
+indiscriminately it is *worse* than ROCMI4 on the metric that matters most, and only a
+per-tensor assignment makes it a clear win.
+
+SYM4 keeps ROCMI4's exact 17-byte block (32 elements, one UE4M3 scale, 4.25 bpw) and changes
+only the code grid:
+
+| format | decoded value | scale | reachable codes | step |
+|---|---|---|---|---|
+| `Q4_0_ROCMI4` | `n * s` | `nearest_ue4m3(amax/7)` | 15 of 16 | `amax/7` |
+| `Q4_0_SYM4` | `(n + 0.5) * s` | `nearest_ue4m3(amax/7.5)` | **16 of 16** | **`amax/7.5`** |
+
+Because `|x| <= amax = 7*s`, ROCMI4's code `n = -8` can never be selected — one of its 16 codes
+is wasted. SYM4 shifts the grid by half a step so that all 16 codes are reachable and the grid
+is exactly symmetric, which makes the step 6.67% finer and the rounding MSE about 12.9% lower.
+
+The cost is that 16 is an even count, so a symmetric grid **cannot contain zero**: elements
+below half a step are forced onto `±s/2` instead of being represented exactly. On most weight
+tensors the finer step more than pays for this, but not on all of them — hence the per-tensor
+rules.
+
+### Compute paths
+
+Both paths exist, mirroring ROCMI4:
+
+* **W8A8 (decode / default)** — the grid offset is folded into the data rather than corrected
+  afterwards. Since `(n + 0.5) * s == (2n + 1) * (s/2)` and `2n + 1` lies in `[-15, 15]`, it
+  still fits an int8 operand, so the loader emits `2n + 1` and halves the scale and ROCMI4's
+  int8 kernels apply unchanged. The per-byte transform is `((v & 0x7F7F7F7F) << 1) | 0x01010101`.
+* **W4A4 (prefill, `-DGGML_HIP_ROCMI4_W4A4=ON`)** — the `iu4` tensor-core instruction reads the
+  LDS row as packed 4-bit nibbles, so the `2n + 1` trick is impossible (`2n + 1` needs five
+  bits). The nibble stays raw and the offset is corrected in the vec_dot epilogue:
+  `sum_i (n_i + 0.5)*sx*(m_i*dB) = sx*dB*sum_i(n_i*m_i) + 0.5*sx*dB*sum_i m_i`.
+  The activation packer emits `sum_i m_i` into y-row ints 20..23, which ROCMI4's W4A4 vec_dot
+  never reads, so the two formats share one activation buffer layout.
+
+Quantize with the `Q4_0_SYM4` ftype. The file size is **byte-identical** to the ROCMI4 file for
+the same per-tensor assignment, because the block layout is the same.
+
+### Measured on Qwen3.8-27B (single R9700, `-c 512`)
+
+KL divergence against the bf16 model, with `ssm_out` pinned to `Q8_0` in every configuration:
+
+| assignment | Mean KLD | 99% KLD | 99% Δp | RMS Δp | Same top-p |
+|---|---|---|---|---|---|
+| all ROCMI4 | 0.3200 | 7.604 | 37.26% | 14.66% | 86.42% |
+| all SYM4 | 0.2932 | 7.683 | **80.17%** | 14.38% | 88.87% |
+| **tuned SYM4 (below)** | **0.2173** | **4.605** | **30.61%** | **11.13%** | **89.71%** |
+
+Read this table carefully: **all-SYM4 improves the mean but destroys the tail.** Its 99% Δp is
+80.17% against ROCMI4's 37.26%, i.e. the worst 1% of tokens are pushed more than twice as far.
+The tuned assignment fixes that and beats ROCMI4 on every column at once.
+
+### Tuning rules
+
+Enable SYM4 only for these tensor classes:
+
+| tensor class | tensors | why |
+|---|---|---|
+| `token_embd` | 1 | by far the most important single tensor. Swapping just this one from ROCMI4 to SYM4 moves 99% Δp from 63.00% to 35.36% |
+| `ffn_down` | 65 | the only FFN class that improves the tail: 99% Δp 35.36% → 30.63%, Max KLD 18.77 → 16.30 |
+| `attn_output` | 17 | best single-class 99% KLD (5.742) and RMS Δp (12.245%) |
+| `attn_gate` | 48 | best single-class Mean KLD (0.2522) and Same top-p (89.41%) |
+| `attn_k` | 17 | good tail: 99% Δp 32.94% |
+| `attn_q` | 17 | good tail: 99% Δp 31.59% |
+
+Keep ROCMI4 for these:
+
+| tensor class | tensors | evidence |
+|---|---|---|
+| `attn_v` | 17 | adding it moves 99% Δp from 30.61% to **73.20%** |
+| `attn_qkv` | 48 | adding it moves 99% Δp from 73.20% to **76.65%** |
+| `ffn_gate` | 65 | adding it moves 99% Δp from 30.63% to **42.01%** |
+| `ffn_up` | 65 | adding it moves 99% Δp from 42.01% to 36.82%, still short of the 30.63% without it |
+
+The four harmful classes are individually small (`attn_v` is 45 MiB, `ffn_gate`/`ffn_up` 2.9 GiB
+each) yet each one degrades the tail, so the rule is not "use SYM4 where it is large" — it has
+to be applied class by class. `attn_v` and `attn_qkv` are the sharpest examples: they are the
+smallest classes in the set, and they are the ones that break the tail worst.
+
+Reproduce the tuned assignment:
+
+```bash
+cat > sym4.txt <<'EOF'
+ssm_out=q8_0
+\.ffn_down\.weight=q4_0_sym4
+\.attn_output\.weight=q4_0_sym4
+\.attn_gate\.weight=q4_0_sym4
+\.attn_k\.weight=q4_0_sym4
+\.attn_q\.weight=q4_0_sym4
+EOF
+
+./build-gpu/bin/llama-quantize --tensor-type-file sym4.txt \
+    --token-embedding-type q4_0_sym4 \
+    model-bf16.gguf model-sym4.gguf Q4_0_ROCMI4
+```
+
+Note the two mechanisms at work: `--token-embedding-type` sets `token_embd`, while
+`--tensor-type-file` uses regex search against the tensor name, so the patterns above are
+anchored on `.weight` to avoid also matching `attn_q_norm`, `attn_k_norm`, and the like.
+`ssm_out` must stay pinned to `Q8_0` (or MXFP4) exactly as for ROCMI4.
+
+### Cost
+
+None measurable. On the tuned file, single R9700, `-p 512 -n 128 -r 3`:
+
+| file | size | pp512 | tg128 |
+|---|---|---|---|
+| all ROCMI4 | 14.62 GiB | 1370 ± 401 | 28.52 ± 0.15 |
+| tuned SYM4 | 14.62 GiB | 1338 ± 397 | 28.53 ± 0.18 |
+
+Same size (byte-identical), same decode throughput; the prefill difference is well inside the
+run-to-run spread. The gain is therefore pure KL improvement at zero cost.
+
+### Status
+
+The tuned assignment above was measured on Qwen3.8-27B only. The direction of each class was
+consistent across repeated runs, but the harmful-class result (`attn_v`, `attn_qkv`) is not yet
+explained mechanically — both feed the attention value path, yet `attn_k` and `attn_q` from the
+same projection group are beneficial. Treat the class list as an empirical starting point to
+re-derive per model, not as a universal rule, and re-measure the tail (99% Δp) rather than
+trusting mean KL alone: as the all-SYM4 row shows, a format can win on the mean and still lose
+badly on the tokens that matter.
 
 ## Attribution
 

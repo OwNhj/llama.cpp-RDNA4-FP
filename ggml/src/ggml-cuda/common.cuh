@@ -1309,6 +1309,18 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q4_0_ROCMI4> {
     static constexpr int qi = QI_ROCMI4;
 };
 
+// Q4_0_SYM4 shares Q4_0_ROCMI4's block layout, so it reuses ROCMI4's int8 kernels.
+// The grid offset is folded away in the loaders: (n + 0.5)*s == (2n + 1)*(s/2), and
+// 2n+1 lies in [-15, 15], which still fits an int8 tile element. So the loaders emit
+// 2n+1 and halve the scale, and ROCMI4's vec_dot applies unchanged -- no epilogue term.
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_0_SYM4> {
+    static constexpr int qk = QK_ROCMI4;
+    static constexpr int qr = QR_ROCMI4;
+    static constexpr int qi = QI_ROCMI4;
+    static constexpr int bs = sizeof(block_sym4);
+};
+
 template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q2_K> {
     static constexpr int qk = QK_K;

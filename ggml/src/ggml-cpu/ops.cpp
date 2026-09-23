@@ -5183,6 +5183,7 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_Q4_0_ROCMI4:
+        case GGML_TYPE_Q4_0_SYM4:
             {
                 ggml_compute_forward_get_rows_q(params, dst);
             } break;

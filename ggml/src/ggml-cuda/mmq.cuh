@@ -60,6 +60,7 @@ static_assert(sizeof(block_fp4_mmq)  == sizeof(block_q8_1_mmq),    "Unexpected b
 static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
     switch (type_x) {
         case GGML_TYPE_Q4_0_ROCMI4:
+        case GGML_TYPE_Q4_0_SYM4:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
@@ -415,6 +416,8 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_Q8_0:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_MXFP4:   return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_Q4_0_ROCMI4:     return MMQ_DP4A_TXS_Q8_0;
+        // SYM4 has ROCMI4's exact 17-byte block and int8 tile shape.
+        case GGML_TYPE_Q4_0_SYM4:       return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_NVFP4:   return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_Q2_K:    return MMQ_DP4A_TXS_Q2_K;
         case GGML_TYPE_Q3_K:    return MMQ_DP4A_TXS_Q3_K;
@@ -895,6 +898,26 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_rocmi4<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback>);
+#endif
+        case GGML_TYPE_Q4_0_SYM4:
+#if GGML_ROCMI4_W4A4 && defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+            // W4A4. The iu4 MMA reads the LDS row as packed 4-bit nibbles, so the (2n+1) fold
+            // used by W8A8 is impossible here (2n+1 spans [-15,15], five bits). The +0.5 grid
+            // offset is corrected in the vec_dot epilogue instead, using SumM which the
+            // activation packer emits for this type. Write-back is ROCMI4's, unchanged.
+            return ggml_cuda_mmq_util_funcs(
+                -1,
+                ggml_cuda_mmq_load_tiles_sym4_w4a4<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_sym4_w4a4<type, J, fallback>,
+                ggml_cuda_mmq_write_back_rocmi4_w4a4<type, J, fallback>);
+#else
+            // W8A8: (n + 0.5)*e == (2n + 1)*(e/2), and 2n+1 fits an int8 tile element, so the
+            // loader folds the offset away and ROCMI4's int8 vec_dot applies unchanged.
+            return ggml_cuda_mmq_util_funcs(
+                -1,
+                ggml_cuda_mmq_load_tiles_sym4<type, J, fallback>,
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
 #endif

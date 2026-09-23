@@ -9,6 +9,22 @@
 #define GGML_ROCMFP4_UNALIGNED_QS_DWORD_LOAD 1
 #endif
 
+// Q4_0_SYM4 stores value = (n + 0.5)*e. Rewriting it as (2n + 1)*(e/2) turns the offset grid
+// back into a plain integer grid, because 2n+1 lies in [-15, 15] and still fits an int8
+// operand. This serves every dp4a-based path (MMVQ and the MMQ W8A8 loader). The W4A4 iu4
+// MMA cannot use it -- it reads the LDS row as packed 4-bit nibbles -- so that path keeps the
+// raw nibble and corrects in its epilogue instead.
+//
+// Per byte: ((v & 0x7F7F7F7F) << 1) | 0x01010101. Masking the sign bit before the shift stops
+// a byte's carry from reaching its neighbour; the OR then sets bit 0 of every byte.
+static __device__ __forceinline__ int rocmfp4_sym4_shift_offset(const int v) {
+    return ((v & 0x7F7F7F7F) << 1) | 0x01010101;
+}
+
+static __device__ __forceinline__ int2 rocmfp4_sym4_shift_offset(const int2 & v) {
+    return make_int2(rocmfp4_sym4_shift_offset(v.x), rocmfp4_sym4_shift_offset(v.y));
+}
+
 static __device__ __forceinline__ int rocmfp4_get_qs_i32(const void * x, const int & i32) {
 #if defined(GGML_USE_HIP) && GGML_ROCMFP4_UNALIGNED_QS_DWORD_LOAD
     return *((const int *) ((const uint8_t *) x + 4*i32));

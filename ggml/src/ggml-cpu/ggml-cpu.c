@@ -373,6 +373,51 @@ static void ggml_vec_dot_rocmi4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, 
     *s = sumf;
 }
 
+// Q4_0_SYM4 CPU fallback. Same nibble layout as ROCMI4, but the stored nibble n means
+// (n + 0.5) * s_x rather than n * s_x. Expanding the product:
+//
+//   sum_i (n_i + 0.5) * s_x * (m_i * d_y)
+//     = s_x * d_y * sum_i (n_i * m_i)  +  0.5 * s_x * d_y * sum_i m_i
+//     = s_x * d_y * sumi               +  0.5 * s_x * s_y
+//
+// The correction term needs sum_i m_i, and block_q8_1 carries exactly that as
+// `s = d_y * sum(qs)`. That is why this type's vec_dot_type is Q8_1 and not Q8_0.
+static void ggml_vec_dot_sym4_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    assert(nrc == 1);
+    GGML_UNUSED(nrc);
+    assert(n % QK_SYM4 == 0);
+    assert(QK_SYM4 == QK8_1);
+
+    const block_sym4 * GGML_RESTRICT x = (const block_sym4 *) vx;
+    const block_q8_1 * GGML_RESTRICT y = (const block_q8_1 *) vy;
+
+    const int nb = n / QK_SYM4;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float sx = rocmfpx_ue4m3_to_fp32(x[ib].e);
+        const float dy = GGML_CPU_FP16_TO_FP32(y[ib].d);
+
+        int sumi  = 0;
+        int sum_m = 0;   // exact sum of the int8 activations, in int32
+        for (int j = 0; j < QS_SYM4; ++j) {
+            sumi += (int) rocmi4_nibble_i8(x[ib].qs[j] & 0x0Fu) * (int) y[ib].qs[j];
+            sumi += (int) rocmi4_nibble_i8(x[ib].qs[j] >> 4)    * (int) y[ib].qs[j + QS_SYM4];
+        }
+        for (int j = 0; j < QK8_1; ++j) {
+            sum_m += (int) y[ib].qs[j];
+        }
+        // 0.5*sx*dy*sum(m) computed exactly rather than through the fp16 `s` field, which
+        // only has an 11-bit mantissa and is therefore the accuracy limit of the correction.
+        sumf += sx * dy * ((float) sumi + 0.5f * (float) sum_m);
+    }
+
+    *s = sumf;
+}
+
 static void ggml_vec_dot_rocmfpx_fp8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     GGML_UNUSED(bs);
     GGML_UNUSED(bx);
@@ -443,6 +488,14 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = rocmfpx_quantize_row_i4,
         .vec_dot                  = ggml_vec_dot_rocmi4_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q4_0_SYM4] = {
+        .from_float               = rocmfpx_quantize_row_sym4,
+        .vec_dot                  = ggml_vec_dot_sym4_q8_1,
+        // Q8_1 rather than Q8_0: the (n+0.5) grid needs sum_i m_i for its epilogue
+        // correction, and block_q8_1.s carries exactly that.
+        .vec_dot_type             = GGML_TYPE_Q8_1,
         .nrows                    = 1,
     },
     [GGML_TYPE_Q4_1] = {

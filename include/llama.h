@@ -163,6 +163,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_LEAN     = 116,
         LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT_LEAN = 117,
         LLAMA_FTYPE_MOSTLY_Q4_0_ROCMI4           = 118, // native signed-nibble 4-bit + UE4M3
+        LLAMA_FTYPE_MOSTLY_Q4_0_SYM4             = 119, // symmetric 4-bit grid, 17 B block
         LLAMA_FTYPE_MOSTLY_MXFP8         = 42, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_MXFP4         = 43, // except 1d tensors, dense MXFP4 (E2M1 + E8M0 per 32)
 

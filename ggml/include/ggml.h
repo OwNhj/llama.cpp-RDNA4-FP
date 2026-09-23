@@ -438,6 +438,7 @@ extern "C" {
         GGML_TYPE_TURBO3_0          = 105, // TurboQuant 3-bit KV-cache (3.5 bpw)
         GGML_TYPE_TURBO4_0          = 106, // TurboQuant 4-bit KV-cache (4.5 bpw)
         GGML_TYPE_Q4_0_ROCMI4       = 108, // native signed-nibble 4-bit + UE4M3 scale (no codebook)
+        GGML_TYPE_Q4_0_SYM4         = 107, // same block, symmetric grid (n+0.5)*s -- no exact zero
         GGML_TYPE_COUNT   = 109,
     };
 
@@ -495,6 +496,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q4_0_ROCMI4           = 118, // native signed 4-bit integer path
+        GGML_FTYPE_MOSTLY_Q4_0_SYM4              = 119, // symmetric 4-bit grid, 17 B block, 4.25 bpw
         GGML_FTYPE_MOSTLY_MXFP8   = 29, // except 1d tensors
     };
 

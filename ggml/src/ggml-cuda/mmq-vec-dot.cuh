@@ -1383,6 +1383,58 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_rocmi4_w4a4(
 }
 
 // ---------------------------------------------------------------------------
+// Q4_0_SYM4 W4A4. Identical to the ROCMI4 W4A4 vec_dot except that the weight nibble n means
+// (n + 0.5)*sx, so the product picks up an extra term:
+//
+//   sum_i (n_i + 0.5)*sx * (m_i*dB) = sx*dB*sum_i(n_i*m_i) + 0.5*sx*dB*sum_i m_i
+//
+// The MMA still computes sum_i(n_i*m_i) from the raw nibbles (the 2n+1 trick used by the
+// W8A8 loader cannot work here -- 2n+1 spans [-15,15], five bits, and iu4 reads 4-bit
+// nibbles directly). The second term comes from SumM, which the activation packer writes at
+// ints 20..23 of the y row for this type. Both terms share dA and dB, so they fold into one
+// multiply-add per accumulator entry.
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_sym4_w4a4(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+    constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
+    constexpr int ntx           = rows_per_warp / 16;
+
+    const int lane    = threadIdx.x;
+    const int yw      = threadIdx.y;
+    const int i0_base = (yw / ntx) * rows_per_warp;
+    const int j0_base = (yw % ntx) * 16;
+    const int koff    = (lane / 16) * 2;
+    const int rcol    = lane % 16;
+
+#pragma unroll
+    for (int i0 = i0_base; i0 < i0_base + rows_per_warp; i0 += 16) {
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+            const int seg  = k01 / QI8_0;   // 0..3
+            const int xseg = k00 / 8 + seg; // 0..7 global 32-elem segment of the x row
+
+            const int32x2_t A = *(const int32x2_t *) (x + (i0 + rcol) * 44 + xseg*4 + koff);
+
+#pragma unroll
+            for (int j0 = j0_base; j0 < J; j0 += ntx * 16) {
+                const int32x2_t B = *(const int32x2_t *) (y + (j0 + rcol) * MMQ_TILE_Y_K + 4 + seg*4 + koff);
+                const float dB   = ((const float *) (y + (j0 + rcol) * MMQ_TILE_Y_K))[seg];
+                const float sumM = ((const float *) (y + (j0 + rcol) * MMQ_TILE_Y_K))[20 + seg];
+
+                int32x8_t D = {0,0,0,0,0,0,0,0};
+                mma_iu4_gfx12<true, true>(D, A, B);
+
+#pragma unroll
+                for (int l = 0; l < 8; l++) {
+                    const float dA = ((const float *) (x + (i0 + (lane/16)*8 + l) * 44 + 32))[xseg];
+                    sum[(j0/16)*(rows_per_warp/16)*8 + ((i0 - i0_base)/16)*8 + l] +=
+                        dA * dB * ((float) D[l] + 0.5f * sumM);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 template <ggml_type type, int J, bool fallback>
 static __device__ __forceinline__ void ggml_cuda_mmq_write_back_rocmi4_w4a4(
         const float * __restrict__ sum, const int32_t * __restrict__ ids_dst, float * __restrict__ dst,

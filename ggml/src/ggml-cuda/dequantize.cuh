@@ -197,6 +197,17 @@ static __device__ __forceinline__ void dequantize_rocmi4(const void * vx, const 
     v.y = d * (float) q1;
 }
 
+// Q4_0_SYM4: same nibble layout as ROCMI4, value = (n + 0.5) * e.
+static __device__ __forceinline__ void dequantize_sym4(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_sym4 * x = (const block_sym4 *) vx;
+    const float d = rocmfpx_ue4m3_to_fp32_finite(x[ib].e);
+    const uint8_t q = x[ib].qs[iqs];
+    const int8_t q0 = (int8_t) ((q & 0x08u) ? (int) (q | 0xF0u) : (int) (q & 0x07u));
+    const int8_t q1 = (int8_t) (((q >> 4) & 0x08u) ? (int) ((q >> 4) | 0xF0u) : (int) ((q >> 4) & 0x07u));
+    v.x = ((float) q0 + 0.5f) * d;
+    v.y = ((float) q1 + 0.5f) * d;
+}
+
 static __device__ __forceinline__ void dequantize_q5_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q5_0 * x = (const block_q5_0 *) vx;
 

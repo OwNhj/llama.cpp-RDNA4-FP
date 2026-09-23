@@ -442,6 +442,34 @@ static __device__ __forceinline__ float vec_dot_rocmi4_q8_1(
     return __low2float(bq8_1->ds) * rocmfpx_ue4m3_to_fp32_finite(bq4->e) * sumi;
 }
 
+// Q4_0_SYM4 (MMVQ / decode). Same 17-byte block and nibble order as ROCMI4, but the nibble
+// means (n + 0.5)*e. MMVQ uses dp4a, whose operands are full int8, so the grid offset folds
+// into the data exactly as it does in the MMQ W8A8 loader:
+//     (n + 0.5)*e == (2n + 1)*(e/2),   2n+1 in [-15, 15]
+// No epilogue correction is needed on this path. (The W4A4 iu4 MMA cannot use this trick --
+// it reads the LDS row as packed 4-bit nibbles -- so that path corrects in the epilogue.)
+#define VDR_SYM4_Q8_1_MMVQ 2
+#define VDR_SYM4_Q8_1_MMQ  8
+
+static __device__ __forceinline__ float vec_dot_sym4_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_sym4 * bq4 = (const block_sym4 *) vbq + kbx;
+    const int * q8 = (const int *) bq8_1->qs + iqs;
+
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < VDR_SYM4_Q8_1_MMVQ; ++l) {
+        const int aux_q4 = rocmfp4_get_qs_i32(bq4->qs, iqs + l);
+        const int2 v = rocmfp4_sym4_shift_offset(rocmi4_unpack_signed_nibbles(aux_q4));
+        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
+        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+    }
+
+    // The 0.5 factor is the other half of the (2n+1)*(e/2) identity.
+    return __low2float(bq8_1->ds) * 0.5f * rocmfpx_ue4m3_to_fp32_finite(bq4->e) * sumi;
+}
+
 #define VDR_NVFP4_Q8_1_MMVQ 4
 #define VDR_NVFP4_Q8_1_MMQ  8
 

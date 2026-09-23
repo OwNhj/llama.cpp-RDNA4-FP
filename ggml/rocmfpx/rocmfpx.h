@@ -33,6 +33,28 @@ extern "C" {
 #define QR_ROCMFP8 1
 #define QI_ROCMFP8 (QK_ROCMFP8 / (4 * QR_ROCMFP8))
 
+// Q4_0_SYM4: a SYMMETRIC 4-bit grid, otherwise identical to Q4_0_ROCMI4.
+//
+// ROCMI4 stores value = n*s with n in [-8,+7] and s = nearest_ue4m3(amax/7). Because
+// |x| <= amax = 7*s, the code n = -8 (which would mean -8*s = -1.143*amax) is unreachable,
+// so only 15 of the 16 codes are ever used and the step is amax/7.
+//
+// SYM4 instead stores value = (n + 0.5)*s with the SAME signed nibble n in [-8,+7] and
+// s = nearest_ue4m3(amax/7.5). All 16 codes are then reachable, the grid is exactly
+// symmetric, and the step is amax/7.5 -- 6.67% finer, i.e. 12.9% lower rounding MSE.
+//
+// The cost: 16 is an even count, so a symmetric grid CANNOT contain 0. Elements smaller
+// than half a step are forced onto +-s/2 instead of being represented exactly. Whether
+// that is a net win depends on how peaked at zero the weight distribution is -- see
+// q4_0_iu4_design.md section 12 step 16.
+//
+// The block layout is deliberately IDENTICAL to block_rocmi4 (17 bytes, same qs/e), so a
+// comparison between the two isolates the grid shape as the only variable.
+#define QK_SYM4 32
+#define QS_SYM4 (QK_SYM4 / 2)
+#define QR_SYM4 2
+#define QI_SYM4 (QK_SYM4 / (4 * QR_SYM4))
+
 #define QK_ROCMI4 QK_ROCMFPX
 #define QS_ROCMI4 (QK_ROCMI4 / 2)
 #define QR_ROCMI4 2
@@ -68,18 +90,27 @@ typedef struct {
     uint8_t e;
 } block_rocmi4;
 
+// Same 17-byte layout; the nibble is interpreted as (n + 0.5)*s rather than n*s.
+typedef struct {
+    uint8_t qs[QS_SYM4];
+    uint8_t e;
+} block_sym4;
+
 #if defined(__cplusplus)
 static_assert(sizeof(block_rocmfp2) == QS_ROCMFP2 + 2*sizeof(uint8_t), "wrong rocmfp2 block size/padding");
 static_assert(sizeof(block_rocmfp3) == QS_ROCMFP3 + 2*sizeof(uint8_t), "wrong rocmfp3 block size/padding");
 static_assert(sizeof(block_rocmfp6) == QS_ROCMFP6 + 2*sizeof(uint8_t), "wrong rocmfp6 block size/padding");
 static_assert(sizeof(block_rocmfp8) == QS_ROCMFP8 + sizeof(uint8_t), "wrong rocmfp8 block size/padding");
 static_assert(sizeof(block_rocmi4) == QS_ROCMI4 + sizeof(uint8_t), "wrong rocmi4 block size/padding");
+static_assert(sizeof(block_sym4) == QS_SYM4 + sizeof(uint8_t), "wrong sym4 block size/padding");
+static_assert(sizeof(block_sym4) == sizeof(block_rocmi4), "sym4 must match rocmi4 layout exactly");
 #else
 _Static_assert(sizeof(block_rocmfp2) == QS_ROCMFP2 + 2*sizeof(uint8_t), "wrong rocmfp2 block size/padding");
 _Static_assert(sizeof(block_rocmfp3) == QS_ROCMFP3 + 2*sizeof(uint8_t), "wrong rocmfp3 block size/padding");
 _Static_assert(sizeof(block_rocmfp6) == QS_ROCMFP6 + 2*sizeof(uint8_t), "wrong rocmfp6 block size/padding");
 _Static_assert(sizeof(block_rocmfp8) == QS_ROCMFP8 + sizeof(uint8_t), "wrong rocmfp8 block size/padding");
 _Static_assert(sizeof(block_rocmi4) == QS_ROCMI4 + sizeof(uint8_t), "wrong rocmi4 block size/padding");
+_Static_assert(sizeof(block_sym4) == QS_SYM4 + sizeof(uint8_t), "wrong sym4 block size/padding");
 #endif
 
 GGML_API float  rocmfpx_ue4m3_to_fp32(uint8_t e);
@@ -118,6 +149,12 @@ GGML_API size_t rocmfpx_row_size_i4(int64_t k);
 GGML_API void   rocmfpx_quantize_row_i4_ref(const float * GGML_RESTRICT x, block_rocmi4 * GGML_RESTRICT y, int64_t k);
 GGML_API void   rocmfpx_dequantize_row_i4(const block_rocmi4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void   rocmfpx_quantize_row_i4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+GGML_API void   rocmfpx_quantize_row_sym4_ref(const float * GGML_RESTRICT x, block_sym4 * GGML_RESTRICT y, int64_t k);
+GGML_API void   rocmfpx_quantize_row_sym4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+GGML_API void   rocmfpx_dequantize_row_sym4(const block_sym4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API size_t rocmfpx_quantize_sym4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+GGML_API size_t rocmfpx_row_size_sym4(int64_t n_per_row);
+GGML_API bool   rocmfpx_validate_row_data_sym4(const void * data, size_t nbytes);
 GGML_API size_t rocmfpx_quantize_i4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 GGML_API bool   rocmfpx_validate_row_data_i4(const void * data, size_t nbytes);
 

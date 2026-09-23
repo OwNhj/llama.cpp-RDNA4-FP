@@ -1526,6 +1526,103 @@ void rocmfpx_dequantize_row_i4(const block_rocmi4 * GGML_RESTRICT x, float * GGM
     }
 }
 
+// ---------------------------------------------------------------------------
+// Q4_0_SYM4: value = (n + 0.5) * s, n in [-8,+7], s = nearest_ue4m3(amax/7.5).
+// All 16 codes reachable and the grid is symmetric, at the cost of losing the exact 0.
+// ---------------------------------------------------------------------------
+
+// Code for one element: we want (n + 0.5)*s ~= x, so n = round(x/s - 0.5).
+// lroundf gives ties away from zero, matching rocmi4_quantize_code, so the two formats
+// differ only in the grid and not in the rounding rule.
+static int8_t sym4_quantize_code(float x, float inv_scale) {
+    if (!isfinite(x) || inv_scale <= 0.0f) {
+        return 0;
+    }
+
+    int n = (int) lroundf(x * inv_scale - 0.5f);
+    if (n > 7) {
+        n = 7;
+    } else if (n < -8) {
+        n = -8;
+    }
+    return (int8_t) n;
+}
+
+size_t rocmfpx_row_size_sym4(int64_t n_per_row) {
+    assert(n_per_row % QK_SYM4 == 0);
+    return (size_t) (n_per_row / QK_SYM4) * sizeof(block_sym4);
+}
+
+void rocmfpx_dequantize_row_sym4(const block_sym4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_SYM4 == 0);
+
+    const int64_t nb = k / QK_SYM4;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const block_sym4 * xb = x + ib;
+        float * yb = y + ib * QK_SYM4;
+        const float scale = rocmfpx_scale_lookup(xb->e);
+        for (int j = 0; j < QS_SYM4; ++j) {
+            yb[j]           = ((float) rocmi4_nibble_to_i8(xb->qs[j] & 0x0Fu) + 0.5f) * scale;
+            yb[j + QS_SYM4] = ((float) rocmi4_nibble_to_i8(xb->qs[j] >> 4)    + 0.5f) * scale;
+        }
+    }
+}
+
+void rocmfpx_quantize_row_sym4_ref(const float * GGML_RESTRICT x, block_sym4 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_SYM4 == 0);
+
+    const int64_t nb = k / QK_SYM4;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const float * xb = x + ib * QK_SYM4;
+        block_sym4 * yb = y + ib;
+
+        // The grid spans +-7.5*s, so s = amax/7.5 puts the largest code exactly on amax.
+        const float max_abs = rocmfpx_max_abs(xb, QK_SYM4);
+        yb->e = rocmfpx_nearest_scale_ue4m3(max_abs / 7.5f);
+
+        const float scale = rocmfpx_scale_lookup(yb->e);
+        const float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+
+        for (int j = 0; j < QS_SYM4; ++j) {
+            const int8_t q0 = sym4_quantize_code(xb[j],           inv_scale);
+            const int8_t q1 = sym4_quantize_code(xb[j + QS_SYM4], inv_scale);
+            yb->qs[j] = (uint8_t) ((q0 & 0x0F) | ((q1 & 0x0F) << 4));
+        }
+    }
+}
+
+void rocmfpx_quantize_row_sym4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_quantize_row_sym4_ref(x, (block_sym4 *) y, k);
+}
+
+size_t rocmfpx_quantize_sym4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    const size_t row_size = rocmfpx_row_size_sym4(n_per_row);
+    char * qrow = (char *) dst;
+
+    for (int64_t row = 0; row < nrows; ++row) {
+        GGML_UNUSED(imatrix);
+        rocmfpx_quantize_row_sym4_ref(src + row * n_per_row, (block_sym4 *) qrow, n_per_row);
+        qrow += row_size;
+    }
+
+    return (size_t) nrows * row_size;
+}
+
+bool rocmfpx_validate_row_data_sym4(const void * data, size_t nbytes) {
+    if (nbytes % sizeof(block_sym4) != 0) {
+        return false;
+    }
+
+    const block_sym4 * blocks = (const block_sym4 *) data;
+    const size_t nb = nbytes / sizeof(block_sym4);
+    for (size_t i = 0; i < nb; ++i) {
+        if (!rocmfpx_scale_is_valid(blocks[i].e)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void rocmfpx_quantize_row_i4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     rocmfpx_quantize_row_i4_ref(x, (block_rocmi4 *) y, k);
 }

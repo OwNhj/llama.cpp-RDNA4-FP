@@ -454,7 +454,7 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool i4_grid = false>
+template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool i4_grid = false, bool sym4 = false>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
@@ -537,6 +537,21 @@ static __global__ void quantize_mmq_q8_1(
             // store FLOAT bits via float* lvalue: an int lvalue would truncate 0.139 -> 0
             ((float *) y)[row * MMQ_TILE_Y_K + (i0 % 128) / 32] = d_inv > 0.0f ? 1.0f / d_inv : 0.0f;
         }
+        // Q4_0_SYM4 needs sum_i m_i for its epilogue correction. Emit it into ints 20..23 of
+        // the y row, which ROCMI4's W4A4 vec_dot never reads (it uses ints 4..19 for data and
+        // floats 0..3 for scales), so the two types can share one activation buffer layout.
+        // The reduction must run for EVERY lane -- a shuffle inside the `iqs % 32 == 0`
+        // guard below would only be reached by 1/8 of the warp, which is undefined.
+        if (sym4) {
+            int sum4 = c0 + c1 + c2 + c3;
+#pragma unroll
+            for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
+                sum4 += __shfl_xor_sync(0xFFFFFFFF, sum4, offset, WARP_SIZE);
+            }
+            if (iqs % 32 == 0) {
+                ((float *) y)[row * MMQ_TILE_Y_K + 20 + (i0 % 128) / 32] = (float) sum4;
+            }
+        }
     } else {
         q.x = roundf(xi.x*d_inv);
         q.y = roundf(xi.y*d_inv);
@@ -614,10 +629,22 @@ void quantize_mmq_q8_1_cuda(
 #if GGML_ROCMI4_W4A4
     // gfx12 native i4 W4A4: activations pre-quantized to a signed 4-bit grid (dense path only;
     // MoE W4A4 is diverted to cuBLAS by ggml_cuda_should_use_mmq).
-    if (type_src0 == GGML_TYPE_Q4_0_ROCMI4 && GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
-        quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, true><<<num_blocks, block_size, 0, stream>>>(
-            x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);  // dense path: scatter=false ignores it
-        return;
+    //
+    // Q4_0_SYM4 shares ROCMI4's 4-bit grid geometry, but its weight nibble carries a +0.5
+    // offset, so its vec_dot additionally needs SumM (the sum of the 4-bit codes per
+    // 32-element group). The sym4 template parameter makes the packer emit that into the y
+    // row; ROCMI4 passes false and is unaffected.
+    if (GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        if (type_src0 == GGML_TYPE_Q4_0_ROCMI4) {
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, true, false><<<num_blocks, block_size, 0, stream>>>(
+                x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            return;
+        }
+        if (type_src0 == GGML_TYPE_Q4_0_SYM4) {
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, true, true><<<num_blocks, block_size, 0, stream>>>(
+                x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            return;
+        }
     }
 #endif
     switch (mmq_get_q8_1_ds_layout(type_src0)) {

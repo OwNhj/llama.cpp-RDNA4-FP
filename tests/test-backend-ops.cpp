@@ -9919,7 +9919,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // rocmf custom quantized types (ROCm native tensor-core paths): MUL_MAT regression +
     // WMMA verification. CPU reference via dequant (to_float); GPU via int8/i4 WMMA MMQ + MMVQ.
-    for (ggml_type type_a : { GGML_TYPE_Q4_0_ROCMI4 }) {
+    for (ggml_type type_a : { GGML_TYPE_Q4_0_ROCMI4, GGML_TYPE_Q4_0_SYM4 }) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, i, 1*256, {1, 1}, {1, 1}));
         }

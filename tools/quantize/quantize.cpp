@@ -37,6 +37,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q4_0",     LLAMA_FTYPE_MOSTLY_Q4_0,     " 4.34G, +0.4685 ppl @ Llama-3-8B",  },
     { "Q4_1",     LLAMA_FTYPE_MOSTLY_Q4_1,     " 4.78G, +0.4511 ppl @ Llama-3-8B",  },
     { "Q4_0_ROCMI4",           LLAMA_FTYPE_MOSTLY_Q4_0_ROCMI4,           " 4.25 bpw native signed-nibble 4-bit (no codebook)", },
+    { "Q4_0_SYM4",             LLAMA_FTYPE_MOSTLY_Q4_0_SYM4,             " 4.25 bpw symmetric 4-bit grid (n+0.5)*s, no exact zero", },
     { "MXFP4_MOE",LLAMA_FTYPE_MOSTLY_MXFP4_MOE," MXFP4 MoE",  },
     { "MXFP4",    LLAMA_FTYPE_MOSTLY_MXFP4,    " 4.5 bpw MX FP4 (OCP, E2M1 + E8M0)", },
     { "NVFP4",    LLAMA_FTYPE_MOSTLY_NVFP4,    " 4.25 bpw NV FP4 (OCP, E2M1 + UE4M3)", },

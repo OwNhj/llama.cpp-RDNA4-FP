@@ -2022,6 +2022,143 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// ---------------------------------------------------------------------------
+// Q4_0_SYM4 loaders.
+//
+// SYM4 stores value = (n + 0.5) * e with n in [-8,+7]. Rewrite it as
+//     (n + 0.5) * e  ==  (2n + 1) * (e/2)
+// and the offset grid becomes a plain integer grid again: 2n+1 lies in [-15, 15], which
+// still fits an int8 tile element. So the loader emits 2n+1 and halves the scale, and
+// ROCMI4's int8 vec_dots (both the W8A8 and the W4A4 one) apply with NO epilogue change.
+//
+// 2n+1 is computed by rocmfp4_sym4_shift_offset(), defined beside the other nibble helpers in
+// rocmfp4_hip_codebook.cuh so the MMVQ path can share it. Verified for all 16 codes.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_sym4(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q4_0_ROCMI4, I);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif
+
+    constexpr int threads_per_row = MMQ_ITER_K / (4 * QR_ROCMI4);
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kbx  = txi / QI_ROCMI4;
+    const int kqsx = txi % QI_ROCMI4;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+        if (fallback) {
+            i = min(i, i_max);
+        }
+        const block_sym4 * bxi = (const block_sym4 *) x + kbx0 + i*stride + kbx;
+        const int2 v = rocmi4_unpack_signed_nibbles(rocmfp4_get_qs_i32(bxi->qs, kqsx));
+        // fold the +0.5 grid offset into the data: (n+0.5)*e == (2n+1)*(e/2)
+        const int2 w = rocmfp4_sym4_shift_offset(v);
+        const int k0 = kbx * (2 * QI_ROCMI4) + kqsx;
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_qs[i*sram_stride + k0]              = w.x;
+        x_qs[i*sram_stride + k0 + QI_ROCMI4] = w.y;
+#else
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0]              = w.x;
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + QI_ROCMI4] = w.y;
+#endif
+    }
+
+    constexpr int blocks_per_tile_x_row = MMQ_TILE_NE_K / QI_ROCMI4;
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+        if (fallback) {
+            i = min(i, i_max);
+        }
+        const block_sym4 * bxi = (const block_sym4 *) x + kbx0 + i*stride + kbxd;
+        const float d = 0.5f * rocmfpx_ue4m3_to_fp32_finite(bxi->e);   // e/2: the other half of the identity
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*sram_stride + kbxd] = d;
+#else
+        x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + kbxd] = d;
+#endif
+    }
+}
+
+#if GGML_ROCMI4_W4A4
+// Q4_0_SYM4 W4A4.
+//
+// The 2n+1 trick used by the W8A8 loader CANNOT be used here: 2n+1 spans [-15,15], which
+// needs 5 bits, and the iu4 MMA reads the LDS row directly as packed 4-bit nibbles. So the
+// nibble stays raw and the +0.5 offset is corrected in the epilogue instead:
+//
+//   sum_i (n_i + 0.5)*sx * (m_i * dB)  =  sx*dB*sum_i(n_i*m_i)  +  0.5*sx*dB*sum_i m_i
+//                                       =  the unmodified MMA result + 0.5*sx*dB*SumM
+//
+// SumM is the sum of the 4-bit activation codes in a 32-element group. The i4_grid
+// activation packer is extended to also emit it into the y-tile region that ROCMI4's W4A4
+// vec_dot never reads (ints 20..23 of the 36-int row).
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_sym4_w4a4(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int I      = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int warp_size = 32;
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+
+    // Identical structure to ggml_cuda_mmq_load_tiles_rocmi4_w4a4: two threads per
+    // 32-element block, 8 blocks per MMQ_ITER_K=256 row. The nibbles are packed into the
+    // byte-interleaved K order the IU4 tensor core consumes; a dot product is invariant
+    // under any K permutation applied identically to both operands, and the activation
+    // packer emits the same order.
+    constexpr int threads_per_row = 16;
+    constexpr int nrows           = warp_size / threads_per_row;
+    const int txi  = threadIdx.x % threads_per_row;
+    const int kbx  = txi / 2;
+    const int half = txi % 2;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows * nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y * nrows + threadIdx.x / threads_per_row);
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_sym4 * bx = (const block_sym4 *) x + kbx0 + i * stride + kbx;
+        int * row             = x_tile + i * 44;
+
+        const int d0 = rocmfp4_get_qs_i32(bx->qs, 2*half + 0);
+        const int d1 = rocmfp4_get_qs_i32(bx->qs, 2*half + 1);
+
+        const int kp = kbx*4 + half;
+        row[kp + 0] =  (d0       & 0x0F0F0F0F) | ((d1       & 0x0F0F0F0F) << 4);
+        row[kp + 2] = ((d0 >> 4) & 0x0F0F0F0F) | (((d1 >> 4) & 0x0F0F0F0F) << 4);
+    }
+
+    // 8 scales per tile row, one per 32-element block.
+    constexpr int blocks_per_tile_x_row = MMQ_TILE_NE_K / QI_ROCMI4;
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+        if (fallback) {
+            i = min(i, i_max);
+        }
+        const block_sym4 * bxi = (const block_sym4 *) x + kbx0 + i*stride + kbxd;
+        ((float *) (x_tile + i * 44 + 32))[kbxd] = rocmfpx_ue4m3_to_fp32_finite(bxi->e);
+    }
+}
+#endif // GGML_ROCMI4_W4A4
+
 #if GGML_ROCMI4_W4A4
 // ---------------------------------------------------------------------------
 // Q4_0_ROCMI4 native-i4 W4A4 (gfx12, RDNA4): weights stay packed nibbles in
