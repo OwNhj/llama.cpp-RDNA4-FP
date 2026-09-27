@@ -623,6 +623,7 @@ static inline uint8_t ggml_fp32_to_e4m3(float v) {
     return s | (uint8_t) (e << 3) | (uint8_t) m;
 }
 
+
 void quantize_row_mxfp8_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y, int64_t k) {
     static const int qk      = QK_MXFP8;
     static const int qk_sub  = QK_MXFP8_SUB;
@@ -734,6 +735,7 @@ static uint8_t mxfp6_quantize_mag(float x) {
     return (uint8_t) ((e << 3) | m);
 }
 
+
 void quantize_row_mxfp6_ref(const float * GGML_RESTRICT x, block_mxfp6 * GGML_RESTRICT y, int64_t k) {
     static const int qk     = QK_MXFP6;
     static const int qk_sub = QK_MXFP6_SUB;
@@ -792,6 +794,83 @@ void dequantize_row_mxfp6(const block_mxfp6 * GGML_RESTRICT x, float * GGML_REST
             for (int j = 0; j < qk_sub; j++) {
                 yb[j] = d * (float) kvalues_mxfp6_e2m3[codes[j]];
             }
+        }
+    }
+}
+
+
+void quantize_row_mxfp4_e4m3_ref(const float * GGML_RESTRICT x, block_mxfp4_e4m3 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_MXFP4_E4M3;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < qk; ++j) {
+            const float ax = fabsf(x[i*qk + j]);
+            if (amax < ax) {
+                amax = ax;
+            }
+        }
+
+        // center the scale so that the largest e2m1 magnitude (6.0) lands on amax
+        const uint8_t ue0 = amax > 0.0f ? ggml_fp32_to_ue4m3(amax / 6.0f) : 0;
+
+        // grid search over neighbouring UE4M3 codes, lowest x^2-weighted SSE wins
+        uint8_t ue = ue0;
+        float best_sse = FLT_MAX;
+        for (int dd = -8; dd <= 4; ++dd) {
+            const int ui = (int) ue0 + dd;
+            if (ui < 1 || ui > 0x7E) {
+                continue;
+            }
+            const uint8_t ue_c = (uint8_t) ui;
+            const float scale = ggml_ue4m3_to_fp32(ue_c);
+
+            float sse = 0.0f;
+            for (int j = 0; j < qk; ++j) {
+                const float xv = x[i*qk + j];
+                const float err = xv - kvalues_mxfp4[best_index_mxfp4(xv, scale)]*scale;
+                sse += xv*xv*err*err;
+            }
+            if (sse < best_sse) {
+                best_sse = sse;
+                ue = ue_c;
+            }
+        }
+
+        const float d = amax > 0.0f ? ggml_ue4m3_to_fp32(ue) : 0.0f;
+
+        y[i].e = ue;
+
+        for (int j = 0; j < qk/2; ++j) {
+            const uint8_t x0 = best_index_mxfp4(x[i*qk + 0    + j], d);
+            const uint8_t x1 = best_index_mxfp4(x[i*qk + qk/2 + j], d);
+
+            y[i].qs[j]  = x0;
+            y[i].qs[j] |= x1 << 4;
+        }
+    }
+}
+
+void dequantize_row_mxfp4_e4m3(const block_mxfp4_e4m3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_MXFP4_E4M3;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_ue4m3_to_fp32(x[i].e);
+
+        for (int j = 0; j < qk/2; ++j) {
+            const int8_t v0 = kvalues_mxfp4[x[i].qs[j] & 0x0F];
+            const int8_t v1 = kvalues_mxfp4[x[i].qs[j] >>   4];
+
+            y[i*qk + j + 0   ] = v0*d;
+            y[i*qk + j + qk/2] = v1*d;
         }
     }
 }
@@ -2786,6 +2865,12 @@ size_t quantize_mxfp6(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     GGML_UNUSED(quant_weights);
     quantize_row_mxfp6_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_MXFP6, n_per_row);
+}
+
+size_t quantize_mxfp4_e4m3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_mxfp4_e4m3_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_MXFP4_E4M3, n_per_row);
 }
 
 size_t quantize_f8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
@@ -6044,6 +6129,16 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                             fprintf(stderr, "ggml_validate_row_data: found invalid e value %d at block %zu sub %zu\n", q[i].e[j], i, j);
                             return false;
                         }
+                    }
+                }
+            } break;
+        case GGML_TYPE_MXFP4_E4M3:
+            {
+                const block_mxfp4_e4m3 * q = (const block_mxfp4_e4m3 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (q[i].e > 0x7e) {
+                        fprintf(stderr, "ggml_validate_row_data: found invalid e value %d at block %zu\n", q[i].e, i);
+                        return false;
                     }
                 }
             } break;

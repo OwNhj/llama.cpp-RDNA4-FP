@@ -74,7 +74,7 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
             return MMQ_Q8_1_DS_LAYOUT_DS4;
         case GGML_TYPE_Q8_0:
             return MMQ_Q8_1_DS_LAYOUT_D4;
-        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP4_E4M3:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_NVFP4:
             return MMQ_Q8_1_DS_LAYOUT_D4;
@@ -415,6 +415,7 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_Q5_1:    return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_Q8_0:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_MXFP4:   return MMQ_DP4A_TXS_Q8_1;
+        case GGML_TYPE_MXFP4_E4M3: return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_Q4_0_ROCMI4:     return MMQ_DP4A_TXS_Q8_0;
         // SYM4 has ROCMI4's exact 17-byte block and int8 tile shape.
         case GGML_TYPE_Q4_0_SYM4:       return MMQ_DP4A_TXS_Q8_0;
@@ -901,6 +902,14 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 ggml_cuda_mmq_load_tiles_mxfp6_fp8<type, J, fallback>,
                 ggml_cuda_mmq_vec_dot_fp8_mma<type, J, fallback, /*x_scale_ints=*/8>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
+        case GGML_TYPE_MXFP4_E4M3:
+            // Same fp8 W8A8 path as MXFP4: e2m1 expands to e4m3 losslessly, so only the scale
+            // decode differs. Scale spacing is 32 elements, hence x_scale_ints = 8 like MXFP4.
+            return ggml_cuda_mmq_util_funcs(
+                -1,
+                ggml_cuda_mmq_load_tiles_mxfp4_e4m3_fp8<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_fp8_mma<type, J, fallback, /*x_scale_ints=*/8>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback>);
         case GGML_TYPE_Q4_0_ROCMI4:
 #if GGML_ROCMI4_W4A4 && defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
             // Native i4 tensor core (lossy activation grid); J % 16 == 0 only.
@@ -985,7 +994,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
     // FP4 tile stores 8 blocks
-    constexpr int ne_block = (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_NVFP4) ? QK_FP4_MMQ : QK8_1_MMQ;
+    constexpr int ne_block = (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_MXFP4_E4M3 || type == GGML_TYPE_NVFP4) ? QK_FP4_MMQ : QK8_1_MMQ;
 #else
     constexpr int ne_block = QK8_1_MMQ;
 #endif  // defined(BLACKWELL_MMA_AVAILABLE)
@@ -1691,6 +1700,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_MXFP8);
 extern DECL_MMQ_CASE(GGML_TYPE_MXFP6);
+extern DECL_MMQ_CASE(GGML_TYPE_MXFP4_E4M3);
 
 // -------------------------------------------------------------------------------------------------------------------------
 

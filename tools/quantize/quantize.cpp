@@ -73,6 +73,8 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q8_0",     LLAMA_FTYPE_MOSTLY_Q8_0,     " 7.96G, +0.0026 ppl @ Llama-3-8B",  },
     { "MXFP8",    LLAMA_FTYPE_MOSTLY_MXFP8,    " 8.25 bpw MX FP8 (OCP, E4M3 + E8M0)", },
     { "MXFP6",    LLAMA_FTYPE_MOSTLY_MXFP6,    " 6.25 bpw MX FP6 (OCP, E2M3 + E8M0)", },
+    { "MXFP4_E4M3", LLAMA_FTYPE_MOSTLY_MXFP4_E4M3, " 4.25 bpw MX FP4 with a UE4M3 block scale", },
+    { "MXFP4_E4M3_MOE", LLAMA_FTYPE_MOSTLY_MXFP4_E4M3_MOE, "MXFP4_E4M3 with MXFP8 for the non-expert tensors", },
     { "F16",      LLAMA_FTYPE_MOSTLY_F16,      "14.00G, +0.0020 ppl @ Mistral-7B",  },
     { "BF16",     LLAMA_FTYPE_MOSTLY_BF16,     "14.00G, -0.0050 ppl @ Mistral-7B",  },
     { "F32",      LLAMA_FTYPE_ALL_F32,         "26.00G              @ 7B",          },

@@ -601,3 +601,21 @@ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const i
         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] >>  4]*0.5f);
     }
 }
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_mxfp4_e4m3(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+
+    const block_mxfp4_e4m3 * x = (const block_mxfp4_e4m3 *) vx + ibs*(QK_K/QK_MXFP4_E4M3);
+
+    const int64_t il = tid/8; // 0...3
+    const int64_t ib = tid%8; // 0...7
+    dst_t * y = yy + 32*ib + 4*il;
+    const uint8_t  * q4 = x[ib].qs + 4*il;
+    // UE4M3 scale, and no *0.5f: this is the raw half of the pairing (see
+    // ggml_cuda_ue4m3_to_fp32_raw_fast), the *0.5f above compensates the doubled int8 table.
+    const float d = ggml_cuda_ue4m3_to_fp32_raw_fast(x[ib].e);
+    for (int j = 0; j < 4; ++j) {
+        y[j+ 0] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] & 0xf]*0.5f);
+        y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] >>  4]*0.5f);
+    }
+}

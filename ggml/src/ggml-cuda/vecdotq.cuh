@@ -509,6 +509,33 @@ static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
 #define VDR_MXFP6_Q8_1_MMVQ 2
 #define VDR_MXFP6_Q8_1_MMQ  1
 
+#define VDR_MXFP4_E4M3_Q8_1_MMVQ 2
+#define VDR_MXFP4_E4M3_Q8_1_MMQ  1
+
+// MXFP4_E4M3: same packed E2M1 nibbles and work-item mapping as MXFP4, only the block scale
+// differs (UE4M3 instead of E8M0). kvalues_mxfp4 stores 2x the e2m1 value, so the scale is
+// halved the same way MXFP4 does it.
+static __device__ __forceinline__ float vec_dot_mxfp4_e4m3_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_mxfp4_e4m3 * bq4 = (const block_mxfp4_e4m3 *) vbq + kbx;
+
+    const int * q8 = (const int *) bq8_1->qs + iqs;
+
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < VDR_MXFP4_E4M3_Q8_1_MMVQ; ++l) {
+        const int aux_q4 = get_int_b1(bq4->qs, iqs + l);
+        const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+
+        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
+        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+    }
+
+    const float d = ggml_cuda_ue4m3_to_fp32_raw_fast(bq4->e) * 0.5f * __low2float(bq8_1->ds);
+    return d * sumi;
+}
+
 using ggml_cuda_vfloat2 = __attribute__((ext_vector_type(2))) float;
 
 // Four packed E2M3 codes (3 bytes) -> 4 int8 magnitudes in one int. The table stores

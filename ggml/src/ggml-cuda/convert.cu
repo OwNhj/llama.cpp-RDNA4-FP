@@ -415,6 +415,19 @@ static void dequantize_row_mxfp4_cuda(const void * vx, dst_t * y, const int64_t 
 }
 
 template<typename dst_t>
+static __global__ void dequantize_block_mxfp4_e4m3(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const int64_t i = blockIdx.x;
+
+    dequantize_mxfp4_e4m3(vx, i, yy + i*QK_K, threadIdx.x);
+}
+
+template<typename dst_t>
+static void dequantize_row_mxfp4_e4m3_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = (k + QK_K - 1) / QK_K;
+    dequantize_block_mxfp4_e4m3<<<nb, 32, 0, stream>>>(vx, y);
+}
+
+template<typename dst_t>
 static __global__ void dequantize_block_rocmfp4(const void * __restrict__ vx, dst_t * __restrict__ yy) {
 
     const int64_t i   = blockIdx.x;
@@ -624,6 +637,8 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
             return dequantize_row_iq3_s_cuda;
         case GGML_TYPE_MXFP4:
             return dequantize_row_mxfp4_cuda;
+        case GGML_TYPE_MXFP4_E4M3:
+            return dequantize_row_mxfp4_e4m3_cuda;
             return dequantize_row_rocmfp4_hip;
             return dequantize_row_rocmfp4_fast_hip;
             return dequantize_block_cont_cuda<QK_ROCMFP2, QR_ROCMFP2, dequantize_rocmfpx_fp2>;
@@ -696,6 +711,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_iq3_s_cuda;
         case GGML_TYPE_MXFP4:
             return dequantize_row_mxfp4_cuda;
+        case GGML_TYPE_MXFP4_E4M3:
+            return dequantize_row_mxfp4_e4m3_cuda;
             return dequantize_row_rocmfp4_hip;
             return dequantize_row_rocmfp4_fast_hip;
             return dequantize_block_cont_cuda<QK_ROCMFP2, QR_ROCMFP2, dequantize_rocmfpx_fp2>;
@@ -765,6 +782,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_iq3_s_cuda;
         case GGML_TYPE_MXFP4:
             return dequantize_row_mxfp4_cuda;
+        case GGML_TYPE_MXFP4_E4M3:
+            return dequantize_row_mxfp4_e4m3_cuda;
             return dequantize_row_rocmfp4_hip;
             return dequantize_row_rocmfp4_fast_hip;
             return dequantize_block_cont_cuda<QK_ROCMFP2, QR_ROCMFP2, dequantize_rocmfpx_fp2>;

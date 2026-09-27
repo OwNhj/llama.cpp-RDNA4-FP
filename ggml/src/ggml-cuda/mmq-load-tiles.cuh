@@ -1760,6 +1760,69 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
 }
 
+// MXFP4_E4M3 x -> raw E4M3 fp8 SRAM tile (RDNA4 / gfx12 only).
+// Identical to ggml_cuda_mmq_load_tiles_mxfp4_fp8 except for the scale: the block scale is a
+// UE4M3 rather than an E8M0. Uses the bit-manipulation decode (_fast) rather than
+// ggml_cuda_ue4m3_to_fp32_raw, because on RDNA4/HIP that one falls back to software ldexpf and
+// this loader calls it once per 32-element block, which cost about 10% of prefill.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_mxfp4_e4m3_fp8(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+    int   * x_qs = (int   *) x_tile;
+    float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
+
+    constexpr int threads_per_row = MMQ_ITER_K / (4 * QR_MXFP4_E4M3);
+    constexpr int nrows           = warp_size / threads_per_row;
+    const int txi  = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kbx  = txi / QI_MXFP4_E4M3;
+    const int kqsx = txi % QI_MXFP4_E4M3;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_mxfp4_e4m3 * bxi = (const block_mxfp4_e4m3 *) x + kbx0 + i*stride + kbx;
+
+        const int aux  = get_int_b1(bxi->qs, kqsx); // 8 e2m1 nibbles (4 bytes)
+        const int2 vv = get_int_from_table_16(aux, (const int8_t *) ggml_cuda_e2m1_to_e4m3_lut);
+        const uint32_t lo = (uint32_t) vv.x;
+        const uint32_t hi = (uint32_t) vv.y;
+        x_qs[i*sram_stride + 8*kbx + kqsx]      = (int) lo;
+        x_qs[i*sram_stride + 8*kbx + 4 + kqsx]  = (int) hi;
+    }
+
+    // ue4m3 scales: 8 per tile row, raw (no 0.5f int8-table compensation)
+    constexpr int blocks_per_tile_x_row = MMQ_TILE_NE_K / QI_MXFP4_E4M3;
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_mxfp4_e4m3 * bxi = (const block_mxfp4_e4m3 *) x + kbx0 + i*stride + kbxd;
+
+        x_df[i*sram_stride + kbxd] = ggml_cuda_ue4m3_to_fp32_raw_fast(bxi->e);
+    }
+#else
+    GGML_UNUSED_VARS(x, x_tile, kbx0, i_max, stride);
+    NO_DEVICE_CODE;
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+}
+
 // MXFP6 x -> raw E4M3 fp8 SRAM tile (RDNA4 / gfx12 only). Every e2m3 magnitude lands exactly on
 // the e4m3 grid, so the 6 -> 8 bit expansion is lossless and the fp8 WMMA vec_dot runs unchanged.
 // The sub-block shape matches MXFP8 (one E8M0 scale per 32 elements), so the tile is identical

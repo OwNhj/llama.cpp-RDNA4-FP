@@ -70,6 +70,10 @@ void quantize_row_mxfp6(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_mxfp6_ref(x, (block_mxfp6 *) y, k);
 }
 
+void quantize_row_mxfp4_e4m3(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_mxfp4_e4m3_ref(x, (block_mxfp4_e4m3 *) y, k);
+}
+
 void quantize_row_f8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_f8_ref(x, (block_f8 *) y, k);
 }
@@ -476,6 +480,38 @@ void ggml_vec_dot_mxfp6_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
             }
             sumf += d * sumi;
         }
+    }
+    *s = sumf;
+}
+
+// MXFP4_E4M3: same 16 packed E2M1 nibbles per block as MXFP4, only the scale codec differs.
+void ggml_vec_dot_mxfp4_e4m3_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_MXFP4_E4M3 == 0);
+    static_assert(QK_MXFP4_E4M3 == QK8_0, "QK_MXFP4_E4M3 and QK8_0 must be the same");
+
+    const block_mxfp4_e4m3 * GGML_RESTRICT x = vx;
+    const block_q8_0        * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_MXFP4_E4M3;
+
+    float sumf = 0;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d = ggml_ue4m3_to_fp32(x[ib].e) * GGML_CPU_FP16_TO_FP32(y[ib].d);
+        const int8_t * GGML_RESTRICT qy = y[ib].qs;
+
+        int sumi = 0;
+        for (int j = 0; j < QK_MXFP4_E4M3/2; ++j) {
+            const int q = x[ib].qs[j];
+            sumi += qy[j]              * (int) kvalues_mxfp4[q & 0x0F];
+            sumi += qy[j + QK_MXFP4_E4M3/2] * (int) kvalues_mxfp4[q >>   4];
+        }
+        sumf += d * sumi;
     }
     *s = sumf;
 }

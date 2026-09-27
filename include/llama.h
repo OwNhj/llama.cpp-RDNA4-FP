@@ -167,6 +167,8 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_MXFP8         = 42, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_MXFP4         = 43, // except 1d tensors, dense MXFP4 (E2M1 + E8M0 per 32)
         LLAMA_FTYPE_MOSTLY_MXFP6         = 44, // except 1d tensors, MXFP6 (E2M3 + E8M0 per 32)
+        LLAMA_FTYPE_MOSTLY_MXFP4_E4M3    = 45, // except 1d tensors, MXFP4 with a UE4M3 block scale
+        LLAMA_FTYPE_MOSTLY_MXFP4_E4M3_MOE = 46, // except 1d tensors, experts in MXFP4_E4M3
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };

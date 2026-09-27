@@ -947,6 +947,34 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32_raw(uint8_t x) {
 #endif // defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
 }
 
+// Same value as ggml_cuda_ue4m3_to_fp32_raw, built with bit manipulation instead of ldexpf.
+// On RDNA4/HIP the branches above both miss, so the raw helper falls back to software ldexpf,
+// and the fp8 WMMA weight-tile loader calls it once per 32-element block. E8M0 (what MXFP4
+// uses) decodes with a single shift, so that cost showed up as a ~10% prefill regression for
+// MXFP4_E4M3. Identical for every input in 0x00..0x7E, i.e. every code a UE4M3 scale can
+// legally hold; 0x7F is NaN and decodes to a finite value here, as it also does in the raw
+// helper's fast branches.
+// Same value as ggml_cuda_ue4m3_to_fp32_raw, without ldexpf and without a branch.
+//
+// On RDNA4/HIP both hardware branches of the raw helper miss, so it falls back to software
+// ldexpf, and the fp8 WMMA weight loader calls it once per 32-element block. E8M0 (MXFP4's
+// scale) decodes with a single shift, so that showed up as a measurable prefill cost.
+//
+// The select is deliberate: an if/else on exp == 0 is data dependent (many blocks sit in the
+// subnormal range and many do not), so it diverges and both sides end up executing. Measured
+// pp512 on Qwen3.8-27B: 1375 with the branch against 1500 branchless, which is the same as
+// MXFP4's. Exact for every code in 0x00..0x7E, i.e. every legal UE4M3 scale; 0x7F is NaN.
+static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32_raw_fast(uint8_t x) {
+    const uint32_t exp = (x >> 3) & 0xF;
+    const uint32_t man = x & 0x7;
+    // normal: (1 + man/8) * 2^(exp-7); +127 for the f32 bias, man lands at bit 20
+    const uint32_t nb = (exp + 120u) << 23 | man << 20;
+    float nrm;
+    memcpy(&nrm, &nb, sizeof(float));
+    const float sub = (float) man * (1.0f / 512.0f); // subnormal: man * 2^-9, exact
+    return exp == 0 ? sub : nrm;
+}
+
 // Signed e4m3 -> f32: the decode convention the F8 KV cache is written with, matching
 // dequantize_f8() in dequantize.cuh. Note the sign bit has to be handled separately here, because
 // ggml_cuda_ue4m3_to_fp32_raw() decodes the unsigned "ue4m3" variant and ignores bit 7.
@@ -1300,6 +1328,14 @@ struct ggml_cuda_type_traits<GGML_TYPE_MXFP6> {
     static constexpr int qr = QR_MXFP6;
     static constexpr int qi = QI_MXFP6;
     static constexpr int bs = sizeof(block_mxfp6);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MXFP4_E4M3> {
+    static constexpr int qk = QK_MXFP4_E4M3;
+    static constexpr int qr = QR_MXFP4_E4M3;
+    static constexpr int qi = QI_MXFP4_E4M3;
+    static constexpr int bs = sizeof(block_mxfp4_e4m3);
 };
 
 template<>
