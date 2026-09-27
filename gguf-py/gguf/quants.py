@@ -900,6 +900,203 @@ class MXFP8(__Quant, qtype=GGMLQuantizationType.MXFP8):
         return (scale * mag * sign).reshape(n_blocks, cls.block_size)
 
 
+class MXFP6(__Quant, qtype=GGMLQuantizationType.MXFP6):
+    # E2M3 (OCP MX FP6) with one E8M0 scale per 32-element sub-block.
+    # Block: 8 sub-blocks x (24 B packed 6-bit codes + 1 B E8M0) = 200 B / 256 elems.
+    # ref: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
+    #
+    # kvalues are the e2m3 magnitudes scaled by 8, matching kvalues_mxfp6_e2m3 in
+    # ggml-common.h. Code layout is sign in bit 5, exponent in bits 3..4, mantissa in bits 0..2.
+    kvalues = (
+         0,  1,  2,  3,  4,  5,  6,  7,
+         8,  9, 10, 11, 12, 13, 14, 15,
+        16, 18, 20, 22, 24, 26, 28, 30,
+        32, 36, 40, 44, 48, 52, 56, 60,
+         0, -1, -2, -3, -4, -5, -6, -7,
+        -8, -9,-10,-11,-12,-13,-14,-15,
+       -16,-18,-20,-22,-24,-26,-28,-30,
+       -32,-36,-40,-44,-48,-52,-56,-60,
+    )
+
+    @staticmethod
+    # same as ggml_e8m0_to_fp32 in ggml-impl.h
+    def e8m0_to_fp32(x: np.ndarray) -> np.ndarray:
+        bits = np.where(x == 0, np.uint32(0x00400000), np.uint32(x) << np.uint32(23))
+        return bits.view(np.float32)
+
+    @staticmethod
+    # same as mxfp6_scale_for_amax in ggml-quants.c
+    def scale_for_amax(amax: np.ndarray) -> np.ndarray:
+        f, E = np.frexp(amax.astype(np.float32))  # amax = f * 2^E, f in [0.5, 1)
+        p = np.where(f <= 15.0 / 16.0, E - 3, E - 2)
+        return np.where(amax > 0, (p + 127).astype(np.uint8), np.uint8(0))
+
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+        qk_sub = cls.block_size // 8
+
+        blocks = blocks.reshape(n_blocks, 8, qk_sub)
+
+        amax = abs(blocks).max(axis=-1)  # (n_blocks, 8)
+
+        e = cls.scale_for_amax(amax)
+        d_inv = np.where(amax > 0, 1.0 / cls.e8m0_to_fp32(e), 0.0).astype(np.float32)
+
+        v = blocks * d_inv.reshape(n_blocks, 8, 1)
+        av = np.abs(v)
+
+        # v = x / E8M0; the codebook holds e2m3 magnitudes x8, so compare against /8
+        kv = np.array(cls.kvalues, dtype=np.int16).reshape(1, 1, 64).astype(np.float32)
+        mags = np.abs(kv) * np.float32(1.0 / 8.0)
+        errs = np.abs(av.reshape(n_blocks, 8, qk_sub, 1) - mags.reshape(1, 1, 1, 64))
+        code = np.argmin(errs, axis=-1).astype(np.uint8)
+        code = np.where(v < 0, code | np.uint8(0x20), code)
+
+        # little-endian bit packing, matching mxfp6_pack_sub
+        out = np.zeros((n_blocks, 8, 24), dtype=np.uint16)
+        for j in range(qk_sub):
+            bit = 6 * j
+            byte, shift = bit >> 3, bit & 7
+            w = code[:, :, j].astype(np.uint16) << shift
+            out[:, :, byte] |= w & 0xFF
+            if shift > 2:
+                out[:, :, byte + 1] |= w >> 8
+
+        return np.concatenate([out.astype(np.uint8).reshape(n_blocks, -1), e.reshape(n_blocks, -1)], axis=-1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+        qk_sub = cls.block_size // 8
+
+        qs, e = np.hsplit(blocks, [8 * 24])
+        d = cls.e8m0_to_fp32(e.reshape(n_blocks, 8)) * np.float32(1.0 / 8.0)
+
+        qs = qs.reshape(n_blocks, 8, 24)
+        codes = np.zeros((n_blocks, 8, qk_sub), dtype=np.uint8)
+        for b in range(6):
+            bitpos = (6 * np.arange(qk_sub) + b).reshape(1, 1, qk_sub)
+            byte = np.broadcast_to(bitpos >> 3, codes.shape)
+            bit = (qs[np.arange(n_blocks)[:, None, None], np.arange(8)[None, :, None], byte]
+                   >> (bitpos & 7)) & np.uint8(1)
+            codes |= (bit.astype(np.uint8) << b)
+
+        kvalues = np.array(cls.kvalues, dtype=np.int16).reshape(1, 1, 64)
+        vals = np.take_along_axis(kvalues, codes.astype(np.intp), axis=-1).astype(np.float32)
+        return (d.reshape(n_blocks, 8, 1) * vals).reshape(n_blocks, cls.block_size)
+
+
+class MXFP4_E4M3(__Quant, qtype=GGMLQuantizationType.MXFP4_E4M3):
+    # Same packed E2M1 nibbles as MXFP4, but the single scale per 32-element block is a UE4M3
+    # (unsigned E4M3) instead of an E8M0. Block: 1 B UE4M3 + 16 B nibbles = 17 B / 32 elems.
+    # Nibble order matches dequantize_row_mxfp4_e4m3: byte j low nibble -> elem j, high -> elem j+16.
+    kvalues = (0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
+
+    @staticmethod
+    # returns value * 0.5 to match the doubled kvalues, same as ggml_ue4m3_to_fp32
+    def ue4m3_to_fp32(x: np.ndarray) -> np.ndarray:
+        x = x.astype(np.int32)
+        exp = (x >> 3) & 0xF
+        man = (x & 0x7).astype(np.float32)
+        raw = np.where(
+            exp == 0,
+            man * np.float32(2.0 ** -9),
+            (np.float32(1.0) + man / np.float32(8.0)) * np.exp2((exp - 7).astype(np.float32)))
+        return np.where((x == 0) | (x == 0x7F), np.float32(0.0), raw * np.float32(0.5))
+
+    @staticmethod
+    # matching ggml_fp32_to_ue4m3 in ggml-impl.h
+    def fp32_to_ue4m3(x: np.ndarray) -> np.ndarray:
+        x = np.clip(x, 0.0, 448.0).astype(np.float32)
+        bits = x.view(np.uint32)
+        fp32_exp = ((bits >> 23) & 0xFF).astype(np.int32) - 127
+        fp32_man = ((bits >> 20) & 0x7).astype(np.int32)
+        ue4m3_exp = fp32_exp + 7
+
+        sub_man = np.clip((x * np.float32(512.0) + np.float32(0.5)).astype(np.int32), 0, 7)
+        sub_result = np.where(sub_man >= 1, sub_man, 0).astype(np.uint8)
+
+        round_bit = ((bits >> 19) & 1).astype(np.int32)
+        man = fp32_man + round_bit
+        exp = ue4m3_exp.copy()
+        overflow = man > 7
+        man = np.where(overflow, 0, man)
+        exp = np.where(overflow, exp + 1, exp)
+        normal_result = np.where(exp >= 15, np.uint8(0x7E), ((exp << 3) | man).astype(np.uint8))
+
+        return np.where(x <= 0.0, np.uint8(0),
+                        np.where(ue4m3_exp <= 0, sub_result,
+                        np.where(ue4m3_exp >= 15, np.uint8(0x7E), normal_result)))
+
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+        qk = cls.block_size
+        half = qk // 2
+
+        amax = abs(blocks).max(axis=-1)
+
+        # centre on amax / 6.0 (6.0 is the largest e2m1 magnitude) then refine over
+        # neighbouring codes, keeping the lowest x^2-weighted SSE. Same search as
+        # quantize_row_mxfp4_e4m3_ref in ggml-quants.c.
+        ue0 = cls.fp32_to_ue4m3(np.where(amax > 0, amax / np.float32(6.0), np.float32(0.0))).astype(np.int32)
+
+        kv = np.array(cls.kvalues, dtype=np.int8).astype(np.float32).reshape(1, 1, 16)
+        lo_x = blocks[:, :half]
+        hi_x = blocks[:, half:]
+
+        def codes_at(scale, w):
+            # scale (n,), w (n, half) -> nearest e2m1 code per element
+            err = np.abs(scale.reshape(-1, 1, 1) * kv - w.reshape(w.shape[0], w.shape[1], 1))
+            return np.argmin(err, axis=-1)
+
+        def sse_at(scale):
+            tot = np.zeros(n_blocks, dtype=np.float64)
+            for w in (lo_x, hi_x):
+                c = codes_at(scale, w)
+                best = np.take_along_axis(np.broadcast_to(kv, (n_blocks, half, 16)), c[:, :, None], axis=-1)[:, :, 0]
+                err = w - best * scale.reshape(-1, 1)
+                tot += (w * w * err * err).sum(axis=-1)
+            return tot
+
+        best_sse = np.full(n_blocks, np.inf, dtype=np.float64)
+        best_ue = ue0.copy()
+        for dd in range(-8, 5):
+            cand = np.clip(ue0 + dd, 1, 0x7E).astype(np.uint8)
+            sse = sse_at(cls.ue4m3_to_fp32(cand))
+            better = sse < best_sse
+            best_sse = np.where(better, sse, best_sse)
+            best_ue = np.where(better, cand, best_ue)
+
+        e = best_ue.astype(np.uint8)
+        scale = cls.ue4m3_to_fp32(e)
+
+        lo = codes_at(scale, lo_x).astype(np.uint8)
+        hi = codes_at(scale, hi_x).astype(np.uint8)
+
+        qs = lo | (hi << np.uint8(4))
+
+        return np.concatenate([e.reshape(n_blocks, 1), qs], axis=-1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        e, qs = np.hsplit(blocks, [1])
+
+        d = cls.ue4m3_to_fp32(e.reshape(n_blocks)).reshape(n_blocks, 1)
+
+        lo = (qs & np.uint8(0x0F)).astype(np.intp)
+        hi = (qs >> np.uint8(4)).astype(np.intp)
+        idx = np.concatenate([lo, hi], axis=-1)
+
+        kv = np.array(cls.kvalues, dtype=np.int8)
+        vals = kv[idx]
+
+        return d * vals.astype(np.float32)
+
+
 class IQ2_XXS(__Quant, qtype=GGMLQuantizationType.IQ2_XXS):
     ksigns: bytes = (
         b"\x00\x81\x82\x03\x84\x05\x06\x87\x88\x09\x0a\x8b\x0c\x8d\x8e\x0f"

@@ -1243,6 +1243,10 @@ class ModelBase:
                         data_qtype = gguf.GGMLQuantizationType.Q8_0
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_MXFP8:
                         data_qtype = gguf.GGMLQuantizationType.MXFP8
+                    elif self.ftype == gguf.LlamaFileType.MOSTLY_MXFP6:
+                        data_qtype = gguf.GGMLQuantizationType.MXFP6
+                    elif self.ftype == gguf.LlamaFileType.MOSTLY_MXFP4_E4M3:
+                        data_qtype = gguf.GGMLQuantizationType.MXFP4_E4M3
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ1_0:
                         data_qtype = gguf.GGMLQuantizationType.TQ1_0
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ2_0:

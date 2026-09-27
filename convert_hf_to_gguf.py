@@ -57,8 +57,8 @@ def parse_args() -> argparse.Namespace:
         help="path to write to; default: based on input. {ftype} will be replaced by the outtype.",
     )
     parser.add_argument(
-        "--outtype", type=str, choices=["f32", "f16", "bf16", "q8_0", "mxfp8", "tq1_0", "tq2_0", "auto"], default="auto",
-        help="output format - use f32 for float32, f16 for float16, bf16 for bfloat16, q8_0 for Q8_0, mxfp8 for OCP MX FP8 (E4M3 weights + E8M0 per-32 scale), tq1_0 or tq2_0 for ternary, and auto for the highest-fidelity 16-bit float type",
+        "--outtype", type=str, choices=["f32", "f16", "bf16", "q8_0", "mxfp8", "mxfp6", "mxfp4_e4m3", "tq1_0", "tq2_0", "auto"], default="auto",
+        help="output format - use f32 for float32, f16 for float16, bf16 for bfloat16, q8_0 for Q8_0, mxfp8 for OCP MX FP8 (E4M3 weights + E8M0 per-32 scale), mxfp6 for OCP MX FP6 (E2M3 weights + E8M0 per-32 scale), mxfp4_e4m3 for MX FP4 (E2M1 weights + UE4M3 per-32 scale), tq1_0 or tq2_0 for ternary, and auto for the highest-fidelity 16-bit float type",
     )
     parser.add_argument(
         "--bigendian", action="store_true",
@@ -215,6 +215,8 @@ def main() -> None:
         "bf16": gguf.LlamaFileType.MOSTLY_BF16,
         "q8_0": gguf.LlamaFileType.MOSTLY_Q8_0,
         "mxfp8": gguf.LlamaFileType.MOSTLY_MXFP8,
+        "mxfp6": gguf.LlamaFileType.MOSTLY_MXFP6,
+        "mxfp4_e4m3": gguf.LlamaFileType.MOSTLY_MXFP4_E4M3,
         "tq1_0": gguf.LlamaFileType.MOSTLY_TQ1_0,
         "tq2_0": gguf.LlamaFileType.MOSTLY_TQ2_0,
         "auto": gguf.LlamaFileType.GUESSED,
