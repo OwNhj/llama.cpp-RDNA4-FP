@@ -5737,6 +5737,34 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
         }
     }
 
+    {
+        // The MXFP4/MXFP8 MMQ path quantizes activations to e4m3 and multiplies on the fp8 WMMA
+        // units, which is a wider error than the q8_1 int8 path the tests default to. Report it so
+        // the tolerance can be widened to match.
+        const auto & info = ggml_cuda_info();
+        for (int id = 0; id < info.device_count; ++id) {
+            if (GGML_CUDA_CC_IS_RDNA4(info.devices[id].cc)) {
+                features.push_back({ "RDNA4_NATIVE_FP8", "1"});
+                break;
+            }
+        }
+    }
+
+    #if GGML_ROCMI4_W4A4
+    {
+        // W4A4 puts activations on a 4-bit grid, which is much coarser than the q8_1 int8 path the
+        // tests default to. Only report it when the build actually selected that kernel; with the
+        // option off ROCMI4/SYM4 keep the exact int8 path and the default tolerance applies.
+        const auto & info = ggml_cuda_info();
+        for (int id = 0; id < info.device_count; ++id) {
+            if (GGML_CUDA_CC_IS_RDNA4(info.devices[id].cc)) {
+                features.push_back({ "RDNA4_W4A4", "1"});
+                break;
+            }
+        }
+    }
+    #endif
+
     #undef _STRINGIFY
     #undef STRINGIFY
 

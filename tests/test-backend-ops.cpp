@@ -471,6 +471,27 @@ static bool ggml_is_view_op(enum ggml_op op) {
     return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
 }
 
+// MMVQ batch limit for MUL_MAT_ID on RDNA4, mirroring get_mmvq_mmid_max_batch_rdna4() in
+// ggml-cuda/mmvq.cu. At or below it the op uses MMVQ, which quantizes activations to q8_1 (int8);
+// above it, MMQ, which is where the activation format changes. MUL_MAT (non-id) has no per-type
+// table and uses MMVQ_MAX_BATCH_SIZE (8) for every quantized type.
+static int mmvq_mmid_max_batch_rdna4(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4: return 5;
+        case GGML_TYPE_MXFP8:
+        case GGML_TYPE_Q4_0_ROCMI4:
+        case GGML_TYPE_Q4_0_SYM4: return 7;
+        default: return 8;
+    }
+}
+
+// True when activations are quantized to something coarser than q8_1, i.e. the op went through MMQ
+// rather than MMVQ.
+static bool mmq_activation_is_coarse(ggml_type type, int64_t n, bool mul_mat_id) {
+    return mul_mat_id ? n > mmvq_mmid_max_batch_rdna4(type) : n > 8;
+}
+
 static bool backend_has_feature(ggml_backend_t backend, const char * feature_name) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
@@ -4940,6 +4961,23 @@ struct test_mul_mat : public test_case {
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
         }
+        // Below the MMVQ batch limit these ops run through MMVQ, which quantizes activations to q8_1
+        // (int8) whatever the weight format is, so the default tolerance still applies. Only the MMQ
+        // path changes the activation format, so only there is the tolerance widened.
+        if (mmq_activation_is_coarse(type_a, n, /*mul_mat_id =*/ false)) {
+            // RDNA4 MMQ quantizes activations to e4m3 for the fp8 WMMA units. Uniform-grid theory is
+            // 5.8e-4 and the measured worst case 6.1e-4, so 2e-3 leaves about 3x headroom.
+            if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_MXFP8) &&
+                backend_has_feature(backend, "RDNA4_NATIVE_FP8")) {
+                return 2e-3;
+            }
+            // W4A4 puts activations on a 4-bit grid (step amax/7), the coarsest of the three. Theory
+            // is 5.1e-3 for uniform and 9.4e-3 for per-32-block Gaussian inputs, measured 5.3e-3.
+            if ((type_a == GGML_TYPE_Q4_0_ROCMI4 || type_a == GGML_TYPE_Q4_0_SYM4) &&
+                backend_has_feature(backend, "RDNA4_W4A4")) {
+                return 2e-2;
+            }
+        }
         return max_nmse_err();
     }
 
@@ -5151,6 +5189,22 @@ struct test_mul_mat_id : public test_case {
         // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
+        }
+        // See the MUL_MAT case above: at or below the MMVQ batch limit the id path also uses MMVQ,
+        // whose activations stay q8_1 (int8) for every weight format, so the default tolerance holds.
+        if (mmq_activation_is_coarse(type_a, n, /*mul_mat_id =*/ true)) {
+            // RDNA4 MMQ quantizes activations to e4m3 for the fp8 WMMA units. Uniform-grid theory is
+            // 5.8e-4 and the measured worst case 6.1e-4, so 2e-3 leaves about 3x headroom.
+            if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_MXFP8) &&
+                backend_has_feature(backend, "RDNA4_NATIVE_FP8")) {
+                return 2e-3;
+            }
+            // W4A4 puts activations on a 4-bit grid (step amax/7), the coarsest of the three. Theory
+            // is 5.1e-3 for uniform and 9.4e-3 for per-32-block Gaussian inputs, measured 5.3e-3.
+            if ((type_a == GGML_TYPE_Q4_0_ROCMI4 || type_a == GGML_TYPE_Q4_0_SYM4) &&
+                backend_has_feature(backend, "RDNA4_W4A4")) {
+                return 2e-2;
+            }
         }
         return max_nmse_err();
     }
@@ -8929,6 +8983,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_Q1_0,
     GGML_TYPE_Q2_0,
     GGML_TYPE_MXFP4, GGML_TYPE_NVFP4,
+    GGML_TYPE_MXFP8,
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
     GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
     GGML_TYPE_Q6_K,
@@ -9951,6 +10006,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP8, GGML_TYPE_F32, 2880, 32, 2816, {1, 1}, {1, 1}));
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 127, 128, 511, 512}) {

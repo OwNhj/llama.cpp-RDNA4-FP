@@ -26,8 +26,13 @@ improve end-to-end MTP decode when enough proposed tokens are accepted. It does
 not affect ROCmFP2, ROCmFP3, or other tensor types.
 
 Do not enable this option in builds that require exact backend-test agreement.
-No tolerances are relaxed when it is enabled; expected W4A4 numerical
-differences remain visible to tests and users.
+test-backend-ops reports a "RDNA4_W4A4" feature when this option is on, and
+MUL_MAT/MUL_MAT_ID widen their tolerance to 2e-2 above the MMVQ batch limit,
+which is where W4A4 actually runs. Theory for the 4-bit activation grid is
+5.1e-3 for uniform inputs and 9.4e-3 for per-32-block Gaussian inputs, measured
+5.3e-3. At or below that limit the op uses MMVQ, whose activations stay q8_1
+(int8), and the default 5e-4 applies. With the option off, ROCMI4/SYM4 keep the
+exact int8 path everywhere and the default tolerance applies.
 
 ## Measured tradeoff
 
