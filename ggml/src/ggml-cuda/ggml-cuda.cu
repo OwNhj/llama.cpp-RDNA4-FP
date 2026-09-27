@@ -5226,6 +5226,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_NVFP4:
                     case GGML_TYPE_MXFP8:
+                    case GGML_TYPE_MXFP6:
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
                     case GGML_TYPE_Q4_K:
@@ -5738,9 +5739,9 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     }
 
     {
-        // The MXFP4/MXFP8 MMQ path quantizes activations to e4m3 and multiplies on the fp8 WMMA
-        // units, which is a wider error than the q8_1 int8 path the tests default to. Report it so
-        // the tolerance can be widened to match.
+        // The MXFP4/MXFP6/MXFP8 MMQ path quantizes activations to e4m3 and multiplies on the fp8
+        // WMMA units, which is a wider error than the q8_1 int8 path the tests default to. Report
+        // it so the tolerance can be widened to match.
         const auto & info = ggml_cuda_info();
         for (int id = 0; id < info.device_count; ++id) {
             if (GGML_CUDA_CC_IS_RDNA4(info.devices[id].cc)) {

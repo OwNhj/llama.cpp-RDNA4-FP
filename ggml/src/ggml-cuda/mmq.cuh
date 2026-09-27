@@ -895,6 +895,12 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 ggml_cuda_mmq_load_tiles_mxfp8<type, J, fallback>,
                 ggml_cuda_mmq_vec_dot_fp8_mma<type, J, fallback, /*x_scale_ints=*/8>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
+        case GGML_TYPE_MXFP6:
+            return ggml_cuda_mmq_util_funcs(
+                -1,
+                ggml_cuda_mmq_load_tiles_mxfp6_fp8<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_fp8_mma<type, J, fallback, /*x_scale_ints=*/8>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback>);
         case GGML_TYPE_Q4_0_ROCMI4:
 #if GGML_ROCMI4_W4A4 && defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
             // Native i4 tensor core (lossy activation grid); J % 16 == 0 only.
@@ -1684,6 +1690,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_Q4_0_ROCMI4);
 extern DECL_MMQ_CASE(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_MXFP8);
+extern DECL_MMQ_CASE(GGML_TYPE_MXFP6);
 
 // -------------------------------------------------------------------------------------------------------------------------
 

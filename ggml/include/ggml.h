@@ -432,6 +432,7 @@ extern "C" {
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_MXFP8   = 43, // MXFP8 (OCP MX block-scaled FP8 E4M3, 8.25 bpw)
         GGML_TYPE_F8      = 44, // F8 (E4M3 quants + F16 scale per 32 elems, KV-cache only, 8.5 bpw)
+        GGML_TYPE_MXFP6   = 45, // MXFP6 (OCP MX block-scaled FP6 E2M3, 6.25 bpw)
         // ROCmFPx experimental family (ported from the ROCmFPX fork, adapted to this MMQ).
         // Only Q4_0_ROCMI4 is exercised by the W4A4 path; the rest keep the fork numbering
         // so the ported sources compile unchanged.
@@ -498,6 +499,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q4_0_ROCMI4           = 118, // native signed 4-bit integer path
         GGML_FTYPE_MOSTLY_Q4_0_SYM4              = 119, // symmetric 4-bit grid, 17 B block, 4.25 bpw
         GGML_FTYPE_MOSTLY_MXFP8   = 29, // except 1d tensors
+        GGML_FTYPE_MOSTLY_MXFP6   = 30, // except 1d tensors
     };
 
     // available tensor operations:

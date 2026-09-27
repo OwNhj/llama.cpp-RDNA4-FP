@@ -479,6 +479,7 @@ static int mmvq_mmid_max_batch_rdna4(ggml_type type) {
     switch (type) {
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4: return 5;
+        case GGML_TYPE_MXFP6:
         case GGML_TYPE_MXFP8:
         case GGML_TYPE_Q4_0_ROCMI4:
         case GGML_TYPE_Q4_0_SYM4: return 7;
@@ -4967,7 +4968,7 @@ struct test_mul_mat : public test_case {
         if (mmq_activation_is_coarse(type_a, n, /*mul_mat_id =*/ false)) {
             // RDNA4 MMQ quantizes activations to e4m3 for the fp8 WMMA units. Uniform-grid theory is
             // 5.8e-4 and the measured worst case 6.1e-4, so 2e-3 leaves about 3x headroom.
-            if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_MXFP8) &&
+            if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_MXFP6 || type_a == GGML_TYPE_MXFP8) &&
                 backend_has_feature(backend, "RDNA4_NATIVE_FP8")) {
                 return 2e-3;
             }
@@ -5195,7 +5196,7 @@ struct test_mul_mat_id : public test_case {
         if (mmq_activation_is_coarse(type_a, n, /*mul_mat_id =*/ true)) {
             // RDNA4 MMQ quantizes activations to e4m3 for the fp8 WMMA units. Uniform-grid theory is
             // 5.8e-4 and the measured worst case 6.1e-4, so 2e-3 leaves about 3x headroom.
-            if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_MXFP8) &&
+            if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_MXFP6 || type_a == GGML_TYPE_MXFP8) &&
                 backend_has_feature(backend, "RDNA4_NATIVE_FP8")) {
                 return 2e-3;
             }
@@ -8983,7 +8984,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_Q1_0,
     GGML_TYPE_Q2_0,
     GGML_TYPE_MXFP4, GGML_TYPE_NVFP4,
-    GGML_TYPE_MXFP8,
+    GGML_TYPE_MXFP6, GGML_TYPE_MXFP8,
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
     GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
     GGML_TYPE_Q6_K,
@@ -10006,6 +10007,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP6, GGML_TYPE_F32, 2880, 32, 2816, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP8, GGML_TYPE_F32, 2880, 32, 2816, {1, 1}, {1, 1}));
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above

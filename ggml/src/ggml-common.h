@@ -115,6 +115,9 @@ typedef sycl::half2 ggml_half2;
 #define QI_MXFP8 (QK_MXFP8 / (4 * QR_MXFP8))
 #define QR_MXFP8 1
 
+#define QI_MXFP6 (QK_MXFP6 / (4 * QR_MXFP6))
+#define QR_MXFP6 1
+
 #define QI_F8 (QK_F8 / (4 * QR_F8))
 #define QR_F8 1
 
@@ -240,6 +243,18 @@ typedef struct {
     uint8_t e[QK_MXFP8 / QK_MXFP8_SUB];                 // E8M0 scales (8 bytes)
 } block_mxfp8;
 static_assert(sizeof(block_mxfp8) == QK_MXFP8 + sizeof(uint8_t)*(QK_MXFP8/QK_MXFP8_SUB), "wrong mxfp8 block size/padding");
+
+// MXFP6 (OCP MX block-scaled FP6 E2M3): one E8M0 scale per 32-element sub-block, like MXFP8.
+// 32 codes pack into 24 bytes (6 bits each, code j at bit 6*j), so a 256-element super-block
+// is 8*24 + 8 = 200 bytes = 6.25 bpw. Same sub-block shape as MXFP8, so the HIP W8A8 fp8
+// WMMA path can consume it after a 6 -> 8 bit expansion of the quants.
+#define QK_MXFP6 256
+#define QK_MXFP6_SUB 32
+typedef struct {
+    uint8_t qs[QK_MXFP6 / QK_MXFP6_SUB][QK_MXFP6_SUB * 6 / 8]; // packed E2M3 codes (192 bytes)
+    uint8_t e[QK_MXFP6 / QK_MXFP6_SUB];                        // E8M0 scales (8 bytes)
+} block_mxfp6;
+static_assert(sizeof(block_mxfp6) == 6*QK_MXFP6/8 + sizeof(uint8_t)*(QK_MXFP6/QK_MXFP6_SUB), "wrong mxfp6 block size/padding");
 
 // F8: E4M3 quants with one F16 scale per 32-element group (Q8_0-shaped, KV-cache only).
 // 8.5 bpw; the 32-elem group matches the fp8 WMMA K=32 tile (one scale per mma group).
@@ -1158,6 +1173,31 @@ GGML_TABLE_END()
 // MXFP4/NVFP4 behavior.
 GGML_TABLE_BEGIN(int8_t, kvalues_rocmfp4, 16)
     0, 1, 2, 3, 4, 6, 8, 10, 0, -1, -2, -3, -4, -6, -8, -10,
+GGML_TABLE_END()
+
+// e2m3 values (multiplied by 8), bit 5 = sign, bits 4:3 = exp (bias 1), bits 2:0 = mantissa
+GGML_TABLE_BEGIN(int8_t, kvalues_mxfp6_e2m3, 64)
+     0,   1,   2,   3,   4,   5,   6,   7,
+     8,   9,  10,  11,  12,  13,  14,  15,
+    16,  18,  20,  22,  24,  26,  28,  30,
+    32,  36,  40,  44,  48,  52,  56,  60,
+     0,  -1,  -2,  -3,  -4,  -5,  -6,  -7,
+    -8,  -9, -10, -11, -12, -13, -14, -15,
+   -16, -18, -20, -22, -24, -26, -28, -30,
+   -32, -36, -40, -44, -48, -52, -56, -60,
+GGML_TABLE_END()
+
+// e2m3 code -> e4m3 byte. Every e2m3 magnitude lies exactly on the e4m3 grid, so this
+// expansion loses nothing and lets the fp8 WMMA path run on mxfp6 weights unchanged.
+GGML_TABLE_BEGIN(uint8_t, kvalues_mxfp6_e4m3, 64)
+    0x00, 0x20, 0x28, 0x2c, 0x30, 0x32, 0x34, 0x36,
+    0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f,
+    0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+    0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f,
+    0x80, 0xa0, 0xa8, 0xac, 0xb0, 0xb2, 0xb4, 0xb6,
+    0xb8, 0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf,
+    0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7,
+    0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf,
 GGML_TABLE_END()
 
 #if defined(GGML_COMMON_IMPL_C)

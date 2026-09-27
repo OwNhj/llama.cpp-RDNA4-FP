@@ -66,6 +66,10 @@ void quantize_row_mxfp8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_mxfp8_ref(x, (block_mxfp8 *) y, k);
 }
 
+void quantize_row_mxfp6(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_mxfp6_ref(x, (block_mxfp6 *) y, k);
+}
+
 void quantize_row_f8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_f8_ref(x, (block_f8 *) y, k);
 }
@@ -430,6 +434,45 @@ void ggml_vec_dot_mxfp8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
             for (int j = 0; j < QK_MXFP8_SUB; ++j) {
                 const int sign = (qx[j] & 0x80) ? -1 : 1;
                 sumi += qy[j] * (sign * (int) kvalues_mxfp8[qx[j] & 0x7F]);
+            }
+            sumf += d * sumi;
+        }
+    }
+    *s = sumf;
+}
+
+void ggml_vec_dot_mxfp6_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_MXFP6 == 0);
+    static_assert(QK_MXFP6_SUB == QK8_0, "QK_MXFP6_SUB and QK8_0 must be the same");
+
+    const block_mxfp6 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_MXFP6;
+
+    float sumf = 0;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        for (int s_idx = 0; s_idx < QK_MXFP6 / QK_MXFP6_SUB; ++s_idx) {
+            const float d = GGML_E8M0_TO_FP32(x[ib].e[s_idx]) * (1.0f / 8.0f) * GGML_CPU_FP16_TO_FP32(y[ib * (QK_MXFP6 / QK8_0) + s_idx].d);
+            const int8_t  * qy = y[ib * (QK_MXFP6 / QK8_0) + s_idx].qs;
+
+            const uint8_t * qs = x[ib].qs[s_idx];
+            int sumi = 0;
+            for (int j = 0; j < QK_MXFP6_SUB; ++j) {
+                const int bit = 6*j;
+                const int byte = bit >> 3;
+                const int shift = bit & 7;
+                uint32_t w = qs[byte];
+                if (shift > 2) {
+                    w |= (uint32_t) qs[byte + 1] << 8;
+                }
+                sumi += qy[j] * (int) kvalues_mxfp6_e2m3[(w >> shift) & 0x3F];
             }
             sumf += d * sumi;
         }

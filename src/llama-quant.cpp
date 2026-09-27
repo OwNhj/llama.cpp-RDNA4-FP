@@ -401,6 +401,7 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
             case GGML_TYPE_MXFP8:   return_type = GGML_TYPE_Q8_0;   break;
+            case GGML_TYPE_MXFP6:   return_type = GGML_TYPE_Q8_0;   break;
             case GGML_TYPE_MXFP4:   return_type = GGML_TYPE_Q8_0;   break;
             case GGML_TYPE_NVFP4:   return_type = GGML_TYPE_Q8_0;   break;
             default:
@@ -445,6 +446,8 @@ static llama_ftype fp_ftype_mirror(llama_ftype ftype) {
             return LLAMA_FTYPE_MOSTLY_Q4_0;
         case LLAMA_FTYPE_MOSTLY_MXFP8:
             return LLAMA_FTYPE_MOSTLY_Q8_0;
+        case LLAMA_FTYPE_MOSTLY_MXFP6:
+            return LLAMA_FTYPE_MOSTLY_Q8_0;
         default:
             return ftype;
     }
@@ -466,7 +469,7 @@ static ggml_type fp_type_from_mirror(ggml_type t, ggml_type fp_type) {
             return (fp_type == GGML_TYPE_MXFP4 || fp_type == GGML_TYPE_NVFP4 ||
                     fp_type == GGML_TYPE_Q4_0_ROCMI4 || fp_type == GGML_TYPE_Q4_0_SYM4) ? fp_type : t;
         case GGML_TYPE_Q8_0:
-            return (fp_type == GGML_TYPE_MXFP8) ? fp_type : t;
+            return (fp_type == GGML_TYPE_MXFP8 || fp_type == GGML_TYPE_MXFP6) ? fp_type : t;
         default:
             return t;
     }
@@ -938,6 +941,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
         case LLAMA_FTYPE_MOSTLY_MXFP8:     return GGML_TYPE_MXFP8;
+        case LLAMA_FTYPE_MOSTLY_MXFP6:     return GGML_TYPE_MXFP6;
         case LLAMA_FTYPE_MOSTLY_MXFP4:     return GGML_TYPE_MXFP4;
         case LLAMA_FTYPE_MOSTLY_NVFP4:     return GGML_TYPE_NVFP4;
         case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMI4: return GGML_TYPE_Q4_0_ROCMI4;

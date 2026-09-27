@@ -668,6 +668,134 @@ void quantize_row_mxfp8_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RE
     }
 }
 
+// MXFP6 (E2M3): 32 codes pack into 24 bytes, code j occupying bits 6*j .. 6*j+5.
+static void mxfp6_pack_sub(const uint8_t * GGML_RESTRICT c, uint8_t * GGML_RESTRICT dst) {
+    for (int i = 0; i < QK_MXFP6_SUB; ++i) {
+        const int bit = 6*i;
+        const uint8_t v = c[i];
+        for (int b = 0; b < 6; ++b) {
+            const int pos = bit + b;
+            const uint8_t mask = (uint8_t) (1u << (pos & 7));
+            if (v & (1u << b)) {
+                dst[pos >> 3] |= mask;
+            } else {
+                dst[pos >> 3] &= (uint8_t) ~mask;
+            }
+        }
+    }
+}
+
+static void mxfp6_unpack_sub(const uint8_t * GGML_RESTRICT src, uint8_t * GGML_RESTRICT c) {
+    for (int i = 0; i < QK_MXFP6_SUB; ++i) {
+        const int bit = 6*i;
+        const int byte = bit >> 3;
+        const int shift = bit & 7;
+        uint32_t w = src[byte];
+        if (shift > 2) { // only the last code of the sub-block stops short of a second byte
+            w |= (uint32_t) src[byte + 1] << 8;
+        }
+        c[i] = (uint8_t) ((w >> shift) & 0x3F);
+    }
+}
+
+// smallest integer p with 2^p * 7.5 >= amax, returned as an E8M0 byte
+static uint8_t mxfp6_scale_for_amax(float amax) {
+    if (!(amax > 0.0f) || !isfinite(amax)) {
+        return 0;
+    }
+    int E;
+    const float f = frexpf(amax, &E);   // amax = f * 2^E, f in [0.5, 1)
+    const int p = (f <= 15.0f/16.0f) ? E - 3 : E - 2;
+    return (uint8_t) (p + 127);
+}
+
+// round |x| (already divided by the scale, in [0, 7.5]) to the nearest E2M3 magnitude code
+static uint8_t mxfp6_quantize_mag(float x) {
+    if (!(x > 0.0f)) {
+        return 0;
+    }
+    int e, m;
+    if (x < 1.0f) {
+        e = 0; m = (int) roundf(8.0f*x);
+    } else if (x < 2.0f) {
+        e = 1; m = (int) roundf(8.0f*(x - 1.0f));
+    } else if (x < 4.0f) {
+        e = 2; m = (int) roundf(4.0f*(x - 2.0f));
+    } else {
+        e = 3; m = (int) roundf(2.0f*(x - 4.0f));
+    }
+    if (m > 7) {
+        m = 0;
+        e++;
+    }
+    if (e > 3) {
+        e = 3; m = 7;
+    }
+    return (uint8_t) ((e << 3) | m);
+}
+
+void quantize_row_mxfp6_ref(const float * GGML_RESTRICT x, block_mxfp6 * GGML_RESTRICT y, int64_t k) {
+    static const int qk     = QK_MXFP6;
+    static const int qk_sub = QK_MXFP6_SUB;
+    static const int n_sub  = QK_MXFP6 / QK_MXFP6_SUB;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+    uint8_t codes[QK_MXFP6_SUB];
+
+    for (int i = 0; i < nb; i++) {
+        for (int s = 0; s < n_sub; s++) {
+            const float * xb = x + i*qk + s*qk_sub;
+
+            float amax = 0.0f;
+            for (int j = 0; j < qk_sub; j++) {
+                const float ax = fabsf(xb[j]);
+                if (amax < ax) {
+                    amax = ax;
+                }
+            }
+
+            const uint8_t e = mxfp6_scale_for_amax(amax);
+            y[i].e[s] = e;
+
+            const float d_inv = (amax > 0.0f) ? 1.0f / GGML_E8M0_TO_FP32(e) : 0.0f;
+
+            for (int j = 0; j < qk_sub; j++) {
+                const float v = xb[j] * d_inv;
+                const uint8_t mag = mxfp6_quantize_mag(fabsf(v));
+                codes[j] = (uint8_t) (mag | (v < 0.0f ? 0x20 : 0x00));
+            }
+
+            memset(y[i].qs[s], 0, sizeof(y[i].qs[s]));
+            mxfp6_pack_sub(codes, y[i].qs[s]);
+        }
+    }
+}
+
+void dequantize_row_mxfp6(const block_mxfp6 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk     = QK_MXFP6;
+    static const int qk_sub = QK_MXFP6_SUB;
+    static const int n_sub  = QK_MXFP6 / QK_MXFP6_SUB;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+    uint8_t codes[QK_MXFP6_SUB];
+
+    for (int i = 0; i < nb; i++) {
+        for (int s = 0; s < n_sub; s++) {
+            const float d = GGML_E8M0_TO_FP32(x[i].e[s]) * (1.0f / 8.0f);
+            float * yb = y + i*qk + s*qk_sub;
+
+            mxfp6_unpack_sub(x[i].qs[s], codes);
+            for (int j = 0; j < qk_sub; j++) {
+                yb[j] = d * (float) kvalues_mxfp6_e2m3[codes[j]];
+            }
+        }
+    }
+}
+
 void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK1_0;
 
@@ -2652,6 +2780,12 @@ size_t quantize_mxfp8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     GGML_UNUSED(quant_weights);
     quantize_row_mxfp8_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_MXFP8, n_per_row);
+}
+
+size_t quantize_mxfp6(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_mxfp6_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_MXFP6, n_per_row);
 }
 
 size_t quantize_f8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
@@ -5906,6 +6040,18 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 const block_mxfp8 * q = (const block_mxfp8 *) data;
                 for (size_t i = 0; i < nb; ++i) {
                     for (size_t j = 0; j < QK_MXFP8 / QK_MXFP8_SUB; ++j) {
+                        if (q[i].e[j] == 0xff) {
+                            fprintf(stderr, "ggml_validate_row_data: found invalid e value %d at block %zu sub %zu\n", q[i].e[j], i, j);
+                            return false;
+                        }
+                    }
+                }
+            } break;
+        case GGML_TYPE_MXFP6:
+            {
+                const block_mxfp6 * q = (const block_mxfp6 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    for (size_t j = 0; j < QK_MXFP6 / QK_MXFP6_SUB; ++j) {
                         if (q[i].e[j] == 0xff) {
                             fprintf(stderr, "ggml_validate_row_data: found invalid e value %d at block %zu sub %zu\n", q[i].e[j], i, j);
                             return false;

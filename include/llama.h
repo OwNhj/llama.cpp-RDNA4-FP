@@ -166,6 +166,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q4_0_SYM4             = 119, // symmetric 4-bit grid, 17 B block
         LLAMA_FTYPE_MOSTLY_MXFP8         = 42, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_MXFP4         = 43, // except 1d tensors, dense MXFP4 (E2M1 + E8M0 per 32)
+        LLAMA_FTYPE_MOSTLY_MXFP6         = 44, // except 1d tensors, MXFP6 (E2M3 + E8M0 per 32)
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };

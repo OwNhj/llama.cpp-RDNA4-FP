@@ -506,7 +506,54 @@ static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
 #define VDR_MXFP8_Q8_1_MMVQ 2
 #define VDR_MXFP8_Q8_1_MMQ  1
 
+#define VDR_MXFP6_Q8_1_MMVQ 2
+#define VDR_MXFP6_Q8_1_MMQ  1
+
 using ggml_cuda_vfloat2 = __attribute__((ext_vector_type(2))) float;
+
+// Four packed E2M3 codes (3 bytes) -> 4 int8 magnitudes in one int. The table stores
+// value*8, which fits int8, so dp4a can consume the result directly.
+static __device__ __forceinline__ int ggml_cuda_mxfp6_unpack4(const void * __restrict__ x) {
+    const uint8_t * x8 = (const uint8_t *) x;
+
+    const uint32_t w = (uint32_t) x8[0] | ((uint32_t) x8[1] << 8) | ((uint32_t) x8[2] << 16);
+
+    const int v0 = kvalues_mxfp6_e2m3[ w        & 0x3F];
+    const int v1 = kvalues_mxfp6_e2m3[(w >>  6) & 0x3F];
+    const int v2 = kvalues_mxfp6_e2m3[(w >> 12) & 0x3F];
+    const int v3 = kvalues_mxfp6_e2m3[(w >> 18) & 0x3F];
+
+    return (v0 & 0xFF) | ((v1 & 0xFF) << 8) | ((v2 & 0xFF) << 16) | ((v3 & 0xFF) << 24);
+}
+
+// MXFP6 uses MXFP8's work item mapping (QR = 1, so QI = 64 and vdr = 2): thread step iqs
+// covers elements [4*iqs, 4*iqs+8). 4*iqs is a multiple of 8, so the 8 codes lie in one
+// 6-byte group (8 codes x 6 bits) of the 32-element sub-block.
+static __device__ __forceinline__ float vec_dot_mxfp6_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_mxfp6 * bx = (const block_mxfp6 *) vbq + kbx;
+    const block_q8_1 * by = bq8_1 + iqs / 8;
+
+    const int sub = iqs / 8;             // sub-block holding the E8M0 scale
+    const int grp = (iqs % 8) / 2;       // which 6-byte group of 8 codes
+
+    const uint8_t * qs = bx->qs[sub] + 6*grp;
+
+    const int x0 = ggml_cuda_mxfp6_unpack4(qs);
+    const int x1 = ggml_cuda_mxfp6_unpack4(qs + 3);
+
+    const int * qy = (const int *) by->qs + (iqs % 8);
+    int sumi = 0;
+    sumi = ggml_cuda_dp4a(x0, qy[0], sumi);
+    sumi = ggml_cuda_dp4a(x1, qy[1], sumi);
+
+    const float dx = ggml_cuda_e8m0_to_fp32(bx->e[sub]) * (1.0f / 8.0f);
+    const float dy = __low2float(by->ds);
+
+    return dx * dy * (float) sumi;
+}
+
 
 #if defined(GGML_USE_HIP) && defined(RDNA4)
 // hardware: 2 packed E4M3 (bytes 0,1 of v) -> vfloat2 (gfx12; gfx1250 has the faster v_cvt_f16_fp8)
