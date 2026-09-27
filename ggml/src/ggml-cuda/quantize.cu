@@ -740,7 +740,10 @@ static __global__ void quantize_mmq_mxfp8(
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
     }
 
-    const float d_inv = 448.0f / amax;
+    // An all-zero block (the K padding past ne00, or a genuinely zero activation row) has amax == 0,
+    // and 448/0 = +Inf would turn every 0.0f element into 0*Inf = NaN. The i4 path above guards
+    // both the reciprocal and the scale for the same reason.
+    const float d_inv = amax > 0.0f ? 448.0f / amax : 0.0f;
     // Two values per hardware conversion instruction (v_cvt_pk_fp8_f32 on gfx12) instead of one
     // software encode per value: the scalar encoder needs a frexpf plus rounding branches, which
     // made this kernel ~30% more expensive than its q8_1 counterpart. The d_inv scaling keeps
@@ -749,7 +752,7 @@ static __global__ void quantize_mmq_mxfp8(
     const uint32_t q23 = ggml_cuda_fp32x2_to_e4m3x2(xi.z*d_inv, xi.w*d_inv);
     char4 q = make_char4((int8_t) (q01 & 0xFFu), (int8_t) ((q01 >> 8) & 0xFFu),
                          (int8_t) (q23 & 0xFFu), (int8_t) ((q23 >> 8) & 0xFFu));
-    const float d = 1.0f / d_inv;
+    const float d = d_inv > 0.0f ? 1.0f / d_inv : 0.0f;
 
     // write the block once (normal) or to each of the token's compact rows (scatter)
     const int nwrite = scatter ? n_expert_used : 1;
