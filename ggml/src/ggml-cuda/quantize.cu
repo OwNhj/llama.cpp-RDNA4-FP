@@ -529,9 +529,17 @@ static __global__ void quantize_mmq_q8_1(
         const int lo4 = (c0 & 0xF) | ((c1 & 0xF) << 8) | ((c2 & 0xF) << 16) | ((c3 & 0xF) << 24);
         const int hi4 = __shfl_xor_sync(0xFFFFFFFF, lo4, 1, WARP_SIZE);
         const int64_t row = (i0 / 128) * ne1 + (scatter ? ids[(int64_t)blockIdx.x * n_expert_used] : blockIdx.x);
-        if (iqs % 8 == 0) {
-            const int pos = i0 % 128;
-            ((int *) y)[row * MMQ_TILE_Y_K + 4 + (pos/32)*4 + (pos/8)%4] = lo4 | (hi4 << 4);
+        const int packed = lo4 | (hi4 << 4);
+        // 16 consecutive ints per 128-elem block live one per even lane. Gather 4 per leader
+        // lane (threadIdx.x % 8 == 0) so the data dword store is one 16B write per 4 lanes.
+        const int lane = threadIdx.x % WARP_SIZE;
+        int4 pack4;
+        pack4.x = __shfl_sync(0xFFFFFFFF, packed, (lane & ~7) + 0, WARP_SIZE);
+        pack4.y = __shfl_sync(0xFFFFFFFF, packed, (lane & ~7) + 2, WARP_SIZE);
+        pack4.z = __shfl_sync(0xFFFFFFFF, packed, (lane & ~7) + 4, WARP_SIZE);
+        pack4.w = __shfl_sync(0xFFFFFFFF, packed, (lane & ~7) + 6, WARP_SIZE);
+        if (lane % 8 == 0) {
+            ((int4 *) y)[row * MMQ_TILE_Y_K / 4 + 1 + lane / 8] = pack4;
         }
         if (iqs % 32 == 0) {
             // store FLOAT bits via float* lvalue: an int lvalue would truncate 0.139 -> 0
