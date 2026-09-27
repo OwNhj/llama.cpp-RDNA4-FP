@@ -564,6 +564,16 @@ static inline uint8_t ggml_fp32_to_ue4m3(float x) {
     return (uint8_t) ((ue4m3_exp << 3) | ue4m3_man);
 }
 
+// ceil variant: smallest code whose scale reaches x, so the max grid value does not clip.
+// ggml_fp32_to_ue4m3 rounds to nearest and can land one code low, clipping the block amax.
+static inline uint8_t ggml_fp32_to_ue4m3_ceil(float x) {
+    uint8_t c = ggml_fp32_to_ue4m3(x);
+    if (c >= 1 && c < 0x7E && ggml_ue4m3_to_fp32(c) < x) {
+        c++;
+    }
+    return c;
+}
+
 /**
  * Converts brain16 to float32.
  *

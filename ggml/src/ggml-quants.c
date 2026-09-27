@@ -641,6 +641,7 @@ static void quantize_row_mxfp8_impl(const float * GGML_RESTRICT x, block_mxfp8 *
             for (int j = 0; j < qk_sub; j++) {
                 amax = MAX(amax, fabsf(xb[j]));
             }
+            GGML_ASSERT(isfinite(amax));
 
             uint8_t e0;
             if (amax == 0.0f) {
@@ -709,6 +710,7 @@ void quantize_row_mxfp8_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RE
                     amax = fabsf(xb[j]);
                 }
             }
+            GGML_ASSERT(isfinite(amax));
 
             uint8_t e;
             if (amax == 0.0f) {
@@ -825,6 +827,7 @@ static void quantize_row_mxfp6_impl(const float * GGML_RESTRICT x, block_mxfp6 *
             for (int j = 0; j < qk_sub; j++) {
                 amax = MAX(amax, fabsf(xb[j]));
             }
+            GGML_ASSERT(isfinite(amax));
 
             const uint8_t e0 = mxfp6_scale_for_amax(amax);
 
@@ -892,6 +895,7 @@ void quantize_row_mxfp6_ref(const float * GGML_RESTRICT x, block_mxfp6 * GGML_RE
                     amax = ax;
                 }
             }
+            GGML_ASSERT(isfinite(amax));
 
             const uint8_t e = mxfp6_scale_for_amax(amax);
             y[i].e[s] = e;
@@ -950,8 +954,9 @@ static void quantize_row_mxfp4_e4m3_impl(const float * GGML_RESTRICT x, block_mx
         for (int j = 0; j < qk; ++j) {
             amax = MAX(amax, fabsf(xb[j]));
         }
+        GGML_ASSERT(isfinite(amax));
 
-        const uint8_t ue0 = amax > 0.0f ? ggml_fp32_to_ue4m3(amax / 6.0f) : 0;
+        const uint8_t ue0 = amax > 0.0f ? ggml_fp32_to_ue4m3_ceil(amax / 6.0f) : 0;
 
         // grid search over candidate UE4M3 codes, pick the lowest importance-weighted SSE
         uint8_t ue = ue0;
@@ -1004,9 +1009,10 @@ void quantize_row_mxfp4_e4m3_ref(const float * GGML_RESTRICT x, block_mxfp4_e4m3
                 amax = ax;
             }
         }
+        GGML_ASSERT(isfinite(amax));
 
         // center the scale so that the largest e2m1 magnitude (6.0) lands on amax
-        const uint8_t ue0 = amax > 0.0f ? ggml_fp32_to_ue4m3(amax / 6.0f) : 0;
+        const uint8_t ue0 = amax > 0.0f ? ggml_fp32_to_ue4m3_ceil(amax / 6.0f) : 0;
 
         // grid search over neighbouring UE4M3 codes, lowest x^2-weighted SSE wins
         uint8_t ue = ue0;

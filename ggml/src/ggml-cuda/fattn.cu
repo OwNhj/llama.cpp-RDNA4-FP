@@ -543,6 +543,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
@@ -698,7 +699,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // kernel on both quality and speed: the f16 kernel brings ncols2=8, multiple warps, nstages=2
         // and stream-K, while a fp8 kernel written from scratch reached only ~2% of fp8 peak.
         // The native kernel can still be forced with F8_NATIVE=1 for comparison.
-        if (getenv("F8_NATIVE") != nullptr &&
+        // The native fp8 kernel ignores sinks (GGML_UNUSED in fattn-mma-f8.cuh), so keep it off when sinks are present.
+        if (getenv("F8_NATIVE") != nullptr && sinks == nullptr &&
                 K->type == GGML_TYPE_F8 && V->type == GGML_TYPE_F8 && (Q->ne[0] == 96 || Q->ne[0] == 128)) {
             return BEST_FATTN_KERNEL_MMA_F8;
         }
