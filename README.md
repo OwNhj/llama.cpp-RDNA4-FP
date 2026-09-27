@@ -48,6 +48,10 @@
 > MXFP8 weights are produced with `./build/bin/llama-quantize in.gguf out.gguf MXFP8`, or directly
 > from a Hugging Face model with `python3 convert_hf_to_gguf.py --outtype mxfp8 --outfile out.gguf <model_dir>`.
 >
+> It also adds **`MXFP6`** (E2M3 + E8M0 per 32, 6.25 bpw) on the same FP8 WMMA path, and an
+> experimental **`MXFP4_E4M3`**, which keeps MXFP4's exact 17-byte block and replaces only the
+> E8M0 scale with a UE4M3. See [MXFP6 and MXFP4_E4M3](#mxfp6-and-mxfp4_e4m3) below.
+>
 
 ## RDNA4 I4 W4A4 (weight 4-bit x activation 4-bit)
 
@@ -281,6 +285,108 @@ same projection group are beneficial. Treat the class list as an empirical start
 re-derive per model, not as a universal rule, and re-measure the tail (99% Δp) rather than
 trusting mean KL alone: as the all-SYM4 row shows, a format can win on the mean and still lose
 badly on the tokens that matter.
+
+## MXFP6 and MXFP4_E4M3
+
+Two more OCP MX formats. Both run on the same RDNA4 FP8 WMMA path as MXFP8, and neither changes
+the compute path itself: the weights are expanded to exact E4M3 at tile load and consumed by the
+existing `v_wmma_f32_16x16x16_fp8_fp8` kernels.
+
+| format | weights | scale | block | bpw |
+|---|---|---|---|---|
+| `MXFP8` | E4M3 | E8M0 | 32 elements | 8.25 |
+| `MXFP6` | E2M3 | E8M0 | 32 elements, 8 per 256-element super-block | 6.25 |
+| `MXFP4` | E2M1 | E8M0 | 32 elements | 4.25 |
+| `MXFP4_E4M3` | E2M1 | **UE4M3** | 32 elements | 4.25 |
+
+Both expansions are lossless, which is what lets them reuse the FP8 path unchanged: every E2M3
+magnitude lies exactly on the E4M3 grid, and so does every E2M1 magnitude. MXFP6's 6-bit codes are
+packed little-endian at bit `6*j` into 24 bytes per sub-block, so a 256-element super-block is
+`8*24 + 8 = 200` bytes.
+
+```bash
+./build-gpu/bin/llama-quantize model-bf16.gguf model-mxfp6.gguf MXFP6
+python3 convert_hf_to_gguf.py --outtype mxfp6 --outfile model.gguf <model_dir>
+```
+
+### MXFP6
+
+Measured on Qwen3.8-27B, single R9700, `-ctk q8_0 -ctv q8_0 -fa 1`, same bf16 source and the same
+imatrix as the MXFP8 row:
+
+| format | bpw | size | PPL | tg128 | tg128 @ d32768 | pp512 |
+|---|---|---|---|---|---|---|
+| `MXFP6` | 6.25 | 19.89 GiB | 41.4351 | 20.86 | 19.18 | 1137 |
+| `MXFP8` | 8.25 | 26.25 GiB | 41.4328 | 19.29 | 18.17 | 1320 |
+
+Perplexity differs by 0.006% while the weights are 24% smaller, and decode is about 8% faster; the
+cost is prefill, which follows from the tile load. MXFP8's quants are whole E4M3 bytes and are
+copied into the tile as they are, while MXFP6 has to unpack 6-bit codes first: 8 codes per 6 bytes
+per 32-element sub-block, one table lookup each, into the same E4M3 bytes.
+
+### MXFP4_E4M3 (experimental)
+
+**`MXFP4_E4M3` is experimental, and its gain over `MXFP4` is small.** It exists to show that the
+FP8 WMMA path carries any 8-bit scale codec, not as a quality upgrade.
+
+The block is byte-for-byte the same 17-byte layout as `MXFP4` (one scale byte, 16 bytes of packed
+E2M1 nibbles, 32 elements, 4.25 bpw), so only the scale codec differs. E8M0 can only land on powers
+of two and therefore wastes range whenever `amax` sits between them; UE4M3 spends its three
+mantissa bits tracking `amax` instead. The scale search centres on `amax / 6.0` (6.0 is the largest
+E2M1 magnitude) and then refines over neighbouring UE4M3 codes.
+
+Measured over 505 tensors of Qwen3.8-27B against the bf16 source, with both files quantized from
+the same source and imatrix:
+
+| format | weight NMSE | PPL | tg128 | pp512 |
+|---|---|---|---|---|
+| `MXFP4` (E8M0) | 0.260916 | 41.8719 | 29.96 | 1475.2 |
+| `MXFP4_E4M3` | 0.256890 (+1.5%) | 41.9048 | 29.86 | 1463.8 |
+
+The NMSE gain is 1.5%, and the perplexity difference of 0.033 is far inside the +/- 0.44 error bar,
+so **perplexity cannot resolve the two formats at all**. E8M0 is already close to optimal on real
+per-32-block weight distributions, which are narrow; UE4M3's extra freedom only pays off with
+smaller blocks. Treat the 1.5% NMSE as the honest size of the win.
+
+Getting within 0.8% of MXFP4 on prefill took one non-obvious fix. The naive UE4M3 decode is a
+branch on `exp == 0`, but scale values diverge across blocks, so both sides of the branch execute
+and prefill measured 1375 t/s against MXFP4's 1475. Decoding branchlessly with bit manipulation
+recovers it to 1464 t/s. A separate fix was needed because `ggml_cuda_ue4m3_to_fp32_raw` falls back
+to software `ldexpf` on HIP (its hardware branches require CDNA3 or non-HIP), and this loader calls
+it once per 32-element block. Branchless decode is exact for every legal code, 0x00 to 0x7E.
+
+### imatrix support
+
+`MXFP6`, `MXFP8` and `MXFP4_E4M3` all take an imatrix. Each has a `quantize_row_*_impl` that scores
+candidate block scales by importance-weighted SSE rather than an unweighted heuristic, mirroring
+what `MXFP4` and `NVFP4` already did; the weight is used instead of `x^2` in the grid search.
+
+`MXFP6` and `MXFP8` previously had no scale search at all, just an amax-derived exponent, so the
+impl adds a small E8M0 grid on top of it. The `quantize_*` entry points take the weighted path only
+when `quant_weights` is non-NULL, so quantizing without an imatrix stays byte-identical to before.
+
+Measured on the test model's 168 tensors, scored with the imatrix weights: weighted SSE 1821.6
+without against 1409.2 with, i.e. 22.6% lower, and **no block in any tensor is worse** (221184 of
+221184 per tensor checked). That per-block guarantee is the useful property: the impl minimises the
+same objective it is scored on, so it cannot regress on that metric.
+
+### Quantization rules
+
+`MXFP6` mirrors `Q6_K`, matching its 256-element block, so the two share a per-tensor assignment.
+For the 4-bit formats and MXFP6 the mirror re-points the 6- and 8-bit slots at the byte-coded
+formats, because there is no Q type above 5 bits to reuse:
+
+* `MXFP4`, `MXFP4_E4M3` and `NVFP4` promote what was `Q6_K` to `MXFP6` and what was `Q8_0` to `MXFP8`.
+  In practice this moves `output.weight`, which every other ftype promotes.
+* `MXFP4_MOE` puts experts in `MXFP4` and now sends the remaining tensors to `MXFP8` rather than `Q8_0`.
+* `MXFP4_E4M3_MOE` is the same rule with experts in `MXFP4_E4M3`.
+
+### Status
+
+`MXFP6` passes all 13 `test-backend-ops` MUL_MAT cases and is used as a real quantization target.
+`MXFP4_E4M3` is experimental: its accuracy win is 1.5% NMSE and invisible in perplexity, and it has
+been measured on one model family only. Both are gated to RDNA4, like `MXFP8`; `should_use_mmq`
+returns false elsewhere.
 
 ## Attribution
 
