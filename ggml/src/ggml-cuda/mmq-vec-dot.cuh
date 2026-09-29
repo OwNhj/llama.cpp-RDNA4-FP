@@ -7,6 +7,16 @@ using namespace ggml_cuda_mma;
 
 #include "mmq.cuh"
 
+// Pascal dp4a MMQ: vec_dot is limited by shared-memory load issue rate, not dp4a throughput.
+//     The x tile loads are invariant across j and the y tile loads across i, but the naive loop
+//     order repeats them (4x and 2x). Hoist them so each is loaded once per (k, j) / (k, i).
+//     Only affects Pascal (no tensor cores, no cp.async); every other architecture keeps the
+//     original loop order.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && \
+    __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A && __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
+#define MMQ_DP4A_HOIST_VEC_LOADS
+#endif
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_0_q8_1_dp4a(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -19,6 +29,76 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * y_qs = (const int   *) y + 4;
     const half2 * y_ds = (const half2 *) y;
 
+#if defined(MMQ_DP4A_HOIST_VEC_LOADS)
+    // x tile loads depend on i only (invariant over j), y tile loads depend on j only (invariant over i):
+    //     hoist each out of the loop that repeats it. Cuts shared-memory load issue slots ~2x.
+    constexpr int max_cpy = ggml_cuda_get_max_cpy_bytes();
+    constexpr int mcpy_int = max_cpy / sizeof(int);
+    static_assert(VDR_Q4_0_Q8_1_MMQ == 4, "bad VDR_Q4_0_Q8_1_MMQ");
+    static_assert(I % warp_size == 0, "bad I");
+    static_assert(J % nwarps == 0, "bad J");
+
+    constexpr int n_i = I / warp_size;
+
+    float x_d_reg[n_i];
+
+    int u_t[2*VDR_Q4_0_Q8_1_MMQ];
+
+#pragma unroll
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QR4_0*VDR_Q4_0_Q8_1_MMQ) {
+        const int k0 = k00 + k01;
+        const int kyqs = QI8_1 * ((k01/2) / (QI8_1/2)) + (k01/2) % (QI8_1/2);
+
+        // x tile ints and scales for this k01: invariant over j, load once per (k01, i)
+        int x_qs_reg[n_i][VDR_Q4_0_Q8_1_MMQ];
+#pragma unroll
+        for (int i0 = 0; i0 < I; i0 += warp_size) {
+            const int i = i0 + threadIdx.x;
+
+            x_d_reg[i0/warp_size] = x_df[i*(MMQ_TILE_NE_K/QI4_0) + i/QI4_0 + k0/(QR4_0*QI4_0)];
+#pragma unroll
+            for (int l = 0; l < VDR_Q4_0_Q8_1_MMQ; ++l) {
+                x_qs_reg[i0/warp_size][l] = x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0 + l];
+            }
+        }
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += nwarps) {
+            const int j = j0 + threadIdx.y;
+
+            int tmp0[4], tmp1[4];
+#pragma unroll
+            for (int l0 = 0; l0 < 4 / mcpy_int; ++l0) {
+                ggml_cuda_memcpy_1<max_cpy>(tmp0 + l0 * mcpy_int, &y_qs[j*MMQ_TILE_Y_K + kyqs + l0 * mcpy_int]  );
+                ggml_cuda_memcpy_1<max_cpy>(tmp1 + l0 * mcpy_int, &y_qs[j*MMQ_TILE_Y_K + kyqs + QI4_0 + l0 * mcpy_int]);
+            }
+            u_t[0]=tmp0[0]; u_t[2]=tmp0[1]; u_t[4]=tmp0[2]; u_t[6]=tmp0[3];
+            u_t[1]=tmp1[0]; u_t[3]=tmp1[1]; u_t[5]=tmp1[2]; u_t[7]=tmp1[3];
+
+            const half2 y_d = y_ds[j*MMQ_TILE_Y_K + k01/QI8_1];
+
+#pragma unroll
+            for (int i0 = 0; i0 < I; i0 += warp_size) {
+                const int v0 = x_qs_reg[i0/warp_size][0];
+                const int v1 = x_qs_reg[i0/warp_size][1];
+                const int v2 = x_qs_reg[i0/warp_size][2];
+                const int v3 = x_qs_reg[i0/warp_size][3];
+
+                int sumi0 = ggml_cuda_dp4a((v0 >> 0) & 0x0F0F0F0F, u_t[0], 0);
+                int sumi1 = ggml_cuda_dp4a((v0 >> 4) & 0x0F0F0F0F, u_t[1], 0);
+                sumi0 = ggml_cuda_dp4a((v1 >> 0) & 0x0F0F0F0F, u_t[2], sumi0);
+                sumi1 = ggml_cuda_dp4a((v1 >> 4) & 0x0F0F0F0F, u_t[3], sumi1);
+                sumi0 = ggml_cuda_dp4a((v2 >> 0) & 0x0F0F0F0F, u_t[4], sumi0);
+                sumi1 = ggml_cuda_dp4a((v2 >> 4) & 0x0F0F0F0F, u_t[5], sumi1);
+                sumi0 = ggml_cuda_dp4a((v3 >> 0) & 0x0F0F0F0F, u_t[6], sumi0);
+                sumi1 = ggml_cuda_dp4a((v3 >> 4) & 0x0F0F0F0F, u_t[7], sumi1);
+
+                sum[j0/nwarps*I/warp_size + i0/warp_size] += x_d_reg[i0/warp_size] *
+                    ((sumi0 + sumi1) * __low2float(y_d) - (8*VDR_Q4_0_Q8_1_MMQ/QI4_0) * __high2float(y_d));
+            }
+        }
+    }
+#else
 // #pragma unroll
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QR4_0*VDR_Q4_0_Q8_1_MMQ) {
         const int k0 = k00 + k01;
@@ -55,6 +135,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             }
         }
     }
+#endif // defined(MMQ_DP4A_HOIST_VEC_LOADS)
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_1_q8_1_dp4a(
@@ -69,6 +150,84 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * y_qs = (const int   *) y + 4;
     const half2 * y_ds = (const half2 *) y;
 
+#if defined(MMQ_DP4A_HOIST_VEC_LOADS)
+    // Same hoist pattern as q4_0 above: x loads out of the j loop, y loads stay in it.
+    constexpr int max_cpy = ggml_cuda_get_max_cpy_bytes();
+    constexpr int mcpy_int = max_cpy / sizeof(int);
+    static_assert(VDR_Q4_0_Q8_1_MMQ == 4, "bad VDR_Q4_0_Q8_1_MMQ");
+    static_assert(I % warp_size == 0, "bad I");
+    static_assert(J % nwarps == 0, "bad J");
+
+    constexpr int n_i = I / warp_size;
+
+    half2 x_dm_reg[n_i];
+
+    int u_t[2*VDR_Q4_0_Q8_1_MMQ];
+
+#pragma unroll
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QR4_1*VDR_Q4_1_Q8_1_MMQ) {
+        const int k0 = k00 + k01;
+        const int kyqs = QI8_1 * ((k01/2) / (QI8_1/2)) + (k01/2) % (QI8_1/2);
+
+        int x_qs_reg[n_i][VDR_Q4_1_Q8_1_MMQ];
+#pragma unroll
+        for (int i0 = 0; i0 < I; i0 += warp_size) {
+            const int i = i0 + threadIdx.x;
+
+            x_dm_reg[i0/warp_size] = x_dm[i*(MMQ_TILE_NE_K/QI4_1) + i/QI4_1 + k0/(QR4_1*QI4_1)];
+#pragma unroll
+            for (int l = 0; l < VDR_Q4_1_Q8_1_MMQ; ++l) {
+                x_qs_reg[i0/warp_size][l] = x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_1 + l];
+            }
+        }
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += nwarps) {
+            const int j = j0 + threadIdx.y;
+
+            int tmp0[4], tmp1[4];
+#pragma unroll
+            for (int l0 = 0; l0 < 4 / mcpy_int; ++l0) {
+                ggml_cuda_memcpy_1<max_cpy>(tmp0 + l0 * mcpy_int, &y_qs[j*MMQ_TILE_Y_K + kyqs + l0 * mcpy_int]  );
+                ggml_cuda_memcpy_1<max_cpy>(tmp1 + l0 * mcpy_int, &y_qs[j*MMQ_TILE_Y_K + kyqs + QI4_1 + l0 * mcpy_int]);
+            }
+            u_t[0]=tmp0[0]; u_t[2]=tmp0[1]; u_t[4]=tmp0[2]; u_t[6]=tmp0[3];
+            u_t[1]=tmp1[0]; u_t[3]=tmp1[1]; u_t[5]=tmp1[2]; u_t[7]=tmp1[3];
+
+            const half2 y_d = y_ds[j*MMQ_TILE_Y_K + k01/QI8_1];
+
+#pragma unroll
+            for (int i0 = 0; i0 < I; i0 += warp_size) {
+                const int v0 = x_qs_reg[i0/warp_size][0];
+                const int v1 = x_qs_reg[i0/warp_size][1];
+                const int v2 = x_qs_reg[i0/warp_size][2];
+                const int v3 = x_qs_reg[i0/warp_size][3];
+
+                int sumi = 0;
+                sumi = ggml_cuda_dp4a((v0 >> 0) & 0x0F0F0F0F, u_t[0], sumi);
+                sumi = ggml_cuda_dp4a((v0 >> 4) & 0x0F0F0F0F, u_t[1], sumi);
+                sumi = ggml_cuda_dp4a((v1 >> 0) & 0x0F0F0F0F, u_t[2], sumi);
+                sumi = ggml_cuda_dp4a((v1 >> 4) & 0x0F0F0F0F, u_t[3], sumi);
+                sumi = ggml_cuda_dp4a((v2 >> 0) & 0x0F0F0F0F, u_t[4], sumi);
+                sumi = ggml_cuda_dp4a((v2 >> 4) & 0x0F0F0F0F, u_t[5], sumi);
+                sumi = ggml_cuda_dp4a((v3 >> 0) & 0x0F0F0F0F, u_t[6], sumi);
+                sumi = ggml_cuda_dp4a((v3 >> 4) & 0x0F0F0F0F, u_t[7], sumi);
+
+                const float2 dm4f = __half22float2(x_dm_reg[i0/warp_size]);
+#ifdef FAST_FP16_AVAILABLE
+                const float2 ds8f = __half22float2(y_d);
+                const float d4d8 = dm4f.x * ds8f.x;
+                const float m4s8 = dm4f.y * ds8f.y;
+#else
+                const float2 ds8f = __half22float2(y_d);
+                const float d4d8 = dm4f.x * ds8f.x;
+                const float m4s8 = dm4f.y * ds8f.y;
+#endif
+                sum[j0/nwarps*I/warp_size + i0/warp_size] += sumi * d4d8 + m4s8 / (QI8_1 / (VDR_Q4_1_Q8_1_MMQ * QR4_1));
+            }
+        }
+    }
+#else
 // #pragma unroll
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QR4_1*VDR_Q4_1_Q8_1_MMQ) {
         const int k0 = k00 + k01;
@@ -105,6 +264,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             }
         }
     }
+#endif // defined(MMQ_DP4A_HOIST_VEC_LOADS)
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a(
@@ -119,6 +279,60 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * y_qs = (const int   *) y + 4;
     const float * y_df = (const float *) y;
 
+#if defined(MMQ_DP4A_HOIST_VEC_LOADS)
+    // x tile loads depend on (i, k0), invariant over j; y tile loads depend on (j, k0), invariant over i.
+    //     Hoist the x loads out of the j loop and the y loads out of the i loop.
+    static_assert(VDR_Q8_0_Q8_1_MMQ == 8, "bad VDR_Q8_0_Q8_1_MMQ");
+    static_assert(I % warp_size == 0, "bad I");
+    static_assert(J % nwarps == 0, "bad J");
+
+    constexpr int n_i = I / warp_size;
+
+    int x_qs_reg[n_i][VDR_Q8_0_Q8_1_MMQ];
+    float x_df_reg[n_i];
+
+#pragma unroll
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += VDR_Q8_0_Q8_1_MMQ) {
+        const int k0 = k00 + k01;
+
+#pragma unroll
+        for (int i0 = 0; i0 < I; i0 += warp_size) {
+            const int i = i0 + threadIdx.x;
+
+            x_df_reg[i0/warp_size] = x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + k0/QI8_0];
+#pragma unroll
+            for (int l = 0; l < VDR_Q8_0_Q8_1_MMQ; ++l) {
+                x_qs_reg[i0/warp_size][l] = x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + l];
+            }
+        }
+
+        const int kyqs  = k0 % MMQ_TILE_NE_K;
+        const int kyds  = (k0/QI8_1) % (MMQ_TILE_NE_K/QI8_1);
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += nwarps) {
+            const int j = j0 + threadIdx.y;
+
+            int u[VDR_Q8_0_Q8_1_MMQ];
+#pragma unroll
+            for (int l = 0; l < VDR_Q8_0_Q8_1_MMQ; ++l) {
+                u[l] = y_qs[j*MMQ_TILE_Y_K + kyqs + l];
+            }
+            const float y_d = y_df[j*MMQ_TILE_Y_K + kyds];
+
+#pragma unroll
+            for (int i0 = 0; i0 < I; i0 += warp_size) {
+                int sumi = 0;
+#pragma unroll
+                for (int l = 0; l < VDR_Q8_0_Q8_1_MMQ; ++l) {
+                    sumi = ggml_cuda_dp4a(x_qs_reg[i0/warp_size][l], u[l], sumi);
+                }
+
+                sum[j0/nwarps*I/warp_size + i0/warp_size] += x_df_reg[i0/warp_size] * y_d * ((float) sumi);
+            }
+        }
+    }
+#else
 // #pragma unroll
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += VDR_Q8_0_Q8_1_MMQ) {
         const int k0 = k00 + k01;
@@ -137,6 +351,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             }
         }
     }
+#endif // defined(MMQ_DP4A_HOIST_VEC_LOADS)
 }
 
 template <ggml_type type, int J, bool fallback, mmq_q8_1_ds_layout ds_layout>
@@ -290,6 +505,63 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * y_qs = (const int   *) y + 4;
     const half2 * y_ds = (const half2 *) y;
 
+#if defined(MMQ_DP4A_HOIST_VEC_LOADS)
+    // q5_1 keeps x in q8_1 layout with the qh bit pre-unpacked, so this is a plain 8-int dot.
+    //     Hoist x loads (i, k0 dependent) out of the j loop and y loads (j, k01 dependent) out of the i loop.
+    constexpr int vdr = QR5_1*VDR_Q5_1_Q8_1_MMQ; // 8
+    static_assert(VDR_Q8_0_Q8_1_MMQ == 8, "bad VDR_Q8_0_Q8_1_MMQ");
+    static_assert(I % warp_size == 0, "bad I");
+    static_assert(J % nwarps == 0, "bad J");
+
+    constexpr int n_i = I / warp_size;
+
+    int x_qs_reg[n_i][vdr];
+    half2 x_dm_reg[n_i];
+
+#pragma unroll
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += vdr) {
+        const int k0 = k00 + k01;
+
+#pragma unroll
+        for (int i0 = 0; i0 < I; i0 += warp_size) {
+            const int i = i0 + threadIdx.x;
+
+            x_dm_reg[i0/warp_size] = x_dm[i*(MMQ_TILE_NE_K/QI5_1) + i/QI5_1 + k0/QI8_1];
+#pragma unroll
+            for (int l = 0; l < vdr; ++l) {
+                x_qs_reg[i0/warp_size][l] = x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + l];
+            }
+        }
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += nwarps) {
+            const int j = j0 + threadIdx.y;
+
+            int u[vdr];
+#pragma unroll
+            for (int l = 0; l < vdr; ++l) {
+                u[l] = y_qs[j*MMQ_TILE_Y_K + k01 + l];
+            }
+            const half2 y_d = y_ds[j*MMQ_TILE_Y_K + k01/QI8_1];
+
+#pragma unroll
+            for (int i0 = 0; i0 < I; i0 += warp_size) {
+                int sumi = 0;
+#pragma unroll
+                for (int l = 0; l < vdr; ++l) {
+                    sumi = ggml_cuda_dp4a(x_qs_reg[i0/warp_size][l], u[l], sumi);
+                }
+
+                const float2 dm8f = __half22float2(x_dm_reg[i0/warp_size]);
+                const float2 ds8f = __half22float2(y_d);
+                const float d8d8 = dm8f.x * ds8f.x;
+                const float m8s8 = dm8f.y * ds8f.y;
+
+                sum[j0/nwarps*I/warp_size + i0/warp_size] += sumi*d8d8 + m8s8 / (QI8_1 / vdr);
+            }
+        }
+    }
+#else
 // #pragma unroll
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += VDR_Q8_0_Q8_1_MMQ) {
         const int k0 = k00 + k01;
@@ -308,6 +580,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             }
         }
     }
+#endif // defined(MMQ_DP4A_HOIST_VEC_LOADS)
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma(
