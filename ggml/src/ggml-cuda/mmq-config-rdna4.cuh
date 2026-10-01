@@ -131,6 +131,11 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_MXFP4_E4M3, 256, 2, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
     CASE(GGML_TYPE_MXFP4_E4M3, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
 
+    // qwen3.8-27B prefill: wider N tiles amortize the x (weight) tile read over more columns.
+    // J=192/nt=256 -> 45.8 KB smem; J=256/nt=512 -> 49.0 KB; both fit the 64 KB smpbo.
+    CASE(GGML_TYPE_MXFP4_E4M3, 256, 2, 128, 192, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP4_E4M3, 512, 2, 128, 256, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+
 // ---------------------------------------------------------------------------------------------
 
     CASE(GGML_TYPE_Q2_K, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K, MMQ_ITER_K, false, true);

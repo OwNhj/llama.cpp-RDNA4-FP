@@ -332,7 +332,7 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
-bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11, int64_t nrows_x) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
@@ -440,6 +440,24 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
             default:
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
+    }
+    if (GGML_CUDA_CC_IS_RDNA4(cc)) {
+        // WMMA beats dp4a as soon as the batch fills a 16-row tile. Only block drafters
+        // (dflash) and serving reach that; plain decode stays at ne11 == 1.
+        //
+        // A weight narrower than one MMQ tile (nrows_x < I == 64) cannot fill the tile grid:
+        // nty == 1 launches a single block of 4 warps, and its 20 K-iterations serialize into
+        // a DRAM latency chain. ssm_alpha/ssm_beta (nrows_x=48, K=5120) measured 21.5 us per
+        // call at 6 GB/s, 1% of DRAM, 2.03 ms per dflash round. MMVQ parallelizes across rows
+        // and tokens instead. Set GGML_MMVQ_SMALL_N=0 to restore the old routing.
+        static const int small_n = [] {
+            const char * e = getenv("GGML_MMVQ_SMALL_N");
+            return e ? atoi(e) : 64;
+        }();
+        if (nrows_x < small_n) {
+            return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
+        return ne11 <= MMVQ_RDNA4_MAX_BATCH_SIZE;
     }
     return ne11 <= MMVQ_MAX_BATCH_SIZE;
 }

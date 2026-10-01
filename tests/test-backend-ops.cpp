@@ -474,7 +474,8 @@ static bool ggml_is_view_op(enum ggml_op op) {
 // MMVQ batch limit for MUL_MAT_ID on RDNA4, mirroring get_mmvq_mmid_max_batch_rdna4() in
 // ggml-cuda/mmvq.cu. At or below it the op uses MMVQ, which quantizes activations to q8_1 (int8);
 // above it, MMQ, which is where the activation format changes. MUL_MAT (non-id) has no per-type
-// table and uses MMVQ_MAX_BATCH_SIZE (8) for every quantized type.
+// table and mirrors should_use_mmvq(), which on RDNA4 caps at MMVQ_RDNA4_MAX_BATCH_SIZE for every
+// quantized type.
 static int mmvq_mmid_max_batch_rdna4(ggml_type type) {
     switch (type) {
         case GGML_TYPE_MXFP4:
@@ -488,10 +489,13 @@ static int mmvq_mmid_max_batch_rdna4(ggml_type type) {
     }
 }
 
+// Batch at or below which RDNA4 uses MMVQ for MUL_MAT; mirrors should_use_mmvq() in ggml-cuda/mmvq.cu.
+#define MMVQ_RDNA4_MAX_BATCH_SIZE 4
+
 // True when activations are quantized to something coarser than q8_1, i.e. the op went through MMQ
 // rather than MMVQ.
 static bool mmq_activation_is_coarse(ggml_type type, int64_t n, bool mul_mat_id) {
-    return mul_mat_id ? n > mmvq_mmid_max_batch_rdna4(type) : n > 8;
+    return mul_mat_id ? n > mmvq_mmid_max_batch_rdna4(type) : n > MMVQ_RDNA4_MAX_BATCH_SIZE;
 }
 
 static bool backend_has_feature(ggml_backend_t backend, const char * feature_name) {
@@ -4738,6 +4742,16 @@ struct test_gated_delta_net : public test_case {
         k = ggml_l2_norm(ctx, k, 1e-6f);
         ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
         return out;
+    }
+
+    double max_nmse_err() override {
+        // the chunked prefill path runs the chunk scan in bf16 WMMA and cannot match the f32
+        // reference to 1e-7. Measured drift is ~7e-6 and does not grow with the token count.
+        const char * env = getenv("GGML_GDN_CHUNKED");
+        if ((env == nullptr || env[0] != '0') && head_size == 128 && n_seq_tokens >= 64) {
+            return 5e-5;
+        }
+        return test_case::max_nmse_err();
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -11113,6 +11127,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 200, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 127, 2));
+    // head_size 128 with n_seq_tokens >= 64 is the only shape that reaches the chunked prefill path
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128,  64, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 100, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 512, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
@@ -11163,6 +11181,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
         }
+    }
+
+    {
+        // radiance fp8 WMMA fast-path correctness probe: M=512 tokens engages the prefill path
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 6144, 512, 5120, {1, 1}, {1, 1}));
     }
 
     return test_cases;
@@ -11352,6 +11375,58 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
             }
         }
+    }
+
+    // BEGIN GGML_TMP_MMQ_SCAN: temporary M-scan for the MoE/MMA occupancy study.
+    // Perf only (reach these with -p). Remove this block once the question is answered.
+    for (int64_t nout : {1024, 2048, 4096, 8192, 16384, 32768}) {
+        for (int64_t ntok : {1, 2, 3, 4, 5, 8, 16}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, nout, ntok, 14336, {1, 1}, {1, 1}));
+        }
+    }
+    // K-scan at fixed N_out=17408: isolates K-loop length at a fixed block count (ntx=1).
+    for (int64_t kk : {5120, 10240, 20480, 40960}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 17408, 8, kk, {1, 1}, {1, 1}));
+    }
+    // N-scan at K=5120 (the real ffn_gate/up contraction) at n=8.
+    for (int64_t nout : {4352, 8704, 17408, 34816}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, nout, 8, 5120, {1, 1}, {1, 1}));
+    }
+    // every real qwen3.8-27B MXFP4/MXFP8 GEMM shape at decode M
+    for (int64_t ntok : {1, 4, 8, 9, 16}) {
+        // MXFP4, N_out=17408 K=5120 (ffn_gate + ffn_up)
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 17408, ntok,  5120, {1, 1}, {1, 1}));
+        // MXFP4, N_out=5120  K=17408 (ffn_down)  and K=6144 (ssm_out/attn_output)
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32,  5120, ntok, 17408, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32,  5120, ntok,  6144, {1, 1}, {1, 1}));
+        // MXFP4, N_out=10240 K=5120 (attn_qkv), 12288 (attn_q), 6144 (attn_gate)
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 10240, ntok,  5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 12288, ntok,  5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32,  6144, ntok,  5120, {1, 1}, {1, 1}));
+        // MXFP4, N_out=1024 K=5120 (attn_k + attn_v), 48 (ssm_alpha/beta)
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32,  1024, ntok,  5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32,    48, ntok,  5120, {1, 1}, {1, 1}));
+        // MXFP8 lm_head / token_embd, N_out=248320 K=5120
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP8, GGML_TYPE_F32, 248320, ntok, 5120, {1, 1}, {1, 1}));
+        // MXFP8 nextn eh_proj, N_out=5120 K=10240
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP8, GGML_TYPE_F32,  5120, ntok, 10240, {1, 1}, {1, 1}));
+    }
+    // END GGML_TMP_MMQ_SCAN
+
+    // qwen3.8-27B prefill GEMM shapes (M=N_out, N=tokens, K=K_in), perf only via -p filter
+    for (int64_t ntok : {256, 512, 1024, 2560}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4_E4M3, GGML_TYPE_F32, 34816, ntok, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4_E4M3, GGML_TYPE_F32, 5120, ntok, 13824, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4_E4M3, GGML_TYPE_F32, 6144, ntok, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4_E4M3, GGML_TYPE_F32, 5120, ntok, 6144, {1, 1}, {1, 1}));
+    }
+    for (int64_t ntok : {512}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 34816, ntok, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 5120, ntok, 13824, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 6144, ntok, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 34816, ntok, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 5120, ntok, 13824, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6144, ntok, 5120, {1, 1}, {1, 1}));
     }
 
     // Q4_K multi-column mat-vec

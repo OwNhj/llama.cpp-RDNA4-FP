@@ -1,8 +1,10 @@
 #include "common.cuh"
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
+// RDNA4 reaches fp8/bf16/int8 WMMA at 16 rows, so MMVQ only wins for narrow batches there.
+#define MMVQ_RDNA4_MAX_BATCH_SIZE 4
 
-bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
+bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11, int64_t nrows_x);
 
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
 // based on the quantization type and GPU architecture (compute capability).

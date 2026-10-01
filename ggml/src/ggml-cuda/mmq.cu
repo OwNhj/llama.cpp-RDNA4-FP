@@ -2,8 +2,10 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "radiance-gemm.cuh"
 
 #include <cstdint>
+#include <unordered_map>
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
@@ -98,6 +100,94 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
+struct ggml_radiance_weight {
+    void * W;
+    void * Ws;
+    void * Wref;
+    int    device;
+};
+
+static std::unordered_map<const void *, ggml_radiance_weight> g_radiance_weights;
+
+static void ggml_cuda_free_radiance_weights() {
+    for (auto & kv : g_radiance_weights) {
+        cudaFree(kv.second.W);
+        cudaFree(kv.second.Ws);
+        cudaFree(kv.second.Wref);
+    }
+    g_radiance_weights.clear();
+}
+
+// radiance W8A8 fp8 WMMA prefill fast path for MXFP4 weights. returns true when handled.
+static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                                         const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    if (getenv("GGML_RAD_DISABLE")) {
+        return false;
+    }
+    if (ids) {
+        return false;
+    }
+    if (src0->ne[2] != 1 || src1->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+
+    const int cc     = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int device = ggml_cuda_get_device();
+
+    const int64_t K    = src0->ne[0];             // also src1->ne[0]
+    const int64_t N    = src0->ne[1];             // dst rows
+    const int64_t M    = src1->ne[1];             // tokens
+
+    const bool contig_w  = src0->nb[1] == ggml_row_size(src0->type, K);
+    const bool contig_a  = src1->nb[1] == K * sizeof(float);
+    const bool contig_dst = dst->nb[1] == N * sizeof(float) && dst->nb[2] == dst->nb[1] * M;
+    const bool dbg = getenv("GGML_RAD_DEBUG") != nullptr;
+    if (!contig_w || !contig_a || !contig_dst) {
+        if (dbg) fprintf(stderr, "[rad] decline contig w=%d a=%d dst=%d K=%ld N=%ld M=%ld\n",
+                          contig_w, contig_a, contig_dst, (long)K, (long)N, (long)M);
+        return false;
+    }
+    if (!ggml_cuda_radiance_supported(cc, src0->type, K, N, M, src1->ne[0], contig_dst)) {
+        if (dbg) fprintf(stderr, "[rad] decline policy K=%ld N=%ld M=%ld type=%d\n",
+                         (long)K, (long)N, (long)M, (int)src0->type);
+        return false;
+    }
+    if (dbg) fprintf(stderr, "[rad] ENGAGE K=%ld N=%ld M=%ld\n", (long)K, (long)N, (long)M);
+
+    cudaStream_t stream = ctx.stream();
+
+    // one-time repack of the weight tensors (weights are static across calls)
+    const void * key = src0->data;
+    auto it = g_radiance_weights.find(key);
+    if (it == g_radiance_weights.end() || it->second.device != device) {
+        ggml_radiance_weight w;
+        w.device = device;
+        const size_t wq_bytes  = (size_t)N * K / 2;
+        const size_t ws_bytes  = (size_t)N * (K / 32);
+        const size_t wref_bytes = (size_t)N;
+        CUDA_CHECK(cudaMalloc(&w.W,    wq_bytes));
+        CUDA_CHECK(cudaMalloc(&w.Ws,   ws_bytes));
+        CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
+        ggml_cuda_radiance_repack(src0->data, K / 32, N, K, w.W, w.Ws, w.Wref, stream);
+        CUDA_CHECK(cudaGetLastError());
+        it = g_radiance_weights.emplace(key, w).first;
+    }
+    const ggml_radiance_weight & w = it->second;
+
+    // activation fp8: prefer the q the fused GLU already produced; else quantize from f32
+    unsigned char * q8 = nullptr;
+    float * as = nullptr;
+    if (!ggml_rad_fused_act_lookup(src1->data, K, (const unsigned char **) &q8, (const float **) &as)) {
+        ggml_cuda_radiance_quantize_tokens((const float *) src1->data, src1->nb[1] / sizeof(float),
+                                           K, M, &q8, &as, stream);
+    }
+
+    ggml_cuda_radiance_gemm_f32(q8, w.W, w.Ws, w.Wref, as,
+                                (float *) dst->data, (int) M, (int) N, (int) K, stream);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -105,6 +195,10 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
 
     GGML_TENSOR_BINARY_OP_LOCALS;
+
+    if (ggml_cuda_mul_mat_q_radiance(ctx, src0, src1, ids, dst)) {
+        return;
+    }
 
     cudaStream_t stream = ctx.stream();
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -438,3 +532,8 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 
     return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
 }
+
+// free cached radiance weight buffers at process exit (fork-local simplification)
+static struct ggml_radiance_weight_dtor {
+    ~ggml_radiance_weight_dtor() { ggml_cuda_free_radiance_weights(); }
+} ggml_radiance_weight_dtor_instance;

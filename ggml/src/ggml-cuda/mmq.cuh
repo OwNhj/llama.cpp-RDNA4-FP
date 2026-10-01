@@ -972,6 +972,22 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
 
 // ---------------------------------------------------------------------------------------------
 
+static constexpr __host__ __device__ bool ggml_cuda_mmq_y_prefetch_dev(ggml_type type_, bool fallback_) {
+    // RDNA4 W8A8 fp8 prefill path: stage both K-halves of the y tile up front so the
+    // x-tile expansion overlaps the y global reads and the second vec_dot needs no barrier.
+    // MEASURED 2026-09-30 (ROCm0, 16 prefill shapes): 0.77-0.86x, mean 0.81x -- slower
+    // everywhere. Removing the mid-iteration barrier costs more than the overlap saves at
+    // occupancy 1 wave/SIMD: the second vec_dot stalls on the x-tile expansion tail anyway.
+    // Keep the plumbing, gate OFF; revisit under P1-2d (A-tiled layout, no x-tile at all).
+    return false;  // gated off: measured regression
+    return !fallback_ &&
+        (type_ == GGML_TYPE_MXFP4_E4M3 || type_ == GGML_TYPE_MXFP8 || type_ == GGML_TYPE_MXFP6);
+}
+
+static inline bool ggml_cuda_mmq_y_prefetch(ggml_type type_, bool fallback_, int cc) {
+    return GGML_CUDA_CC_IS_RDNA4(cc) && ggml_cuda_mmq_y_prefetch_dev(type_, fallback_);
+}
+
 template <ggml_type type, int J, bool fallback, bool fixup>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
@@ -988,9 +1004,16 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr ggml_cuda_mmq_vec_dot_t    vec_dot    = ggml_cuda_mmq_get_vec_dot<type, J, fallback>();
     constexpr ggml_cuda_mmq_write_back_t write_back = ggml_cuda_mmq_get_write_back<type, J, fallback>();
 
+#if defined(RDNA4)
+    constexpr bool y_prefetch = ggml_cuda_mmq_y_prefetch_dev(type, fallback);
+#else
+    constexpr bool y_prefetch = false;
+#endif
+    constexpr int y_pad = GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
     extern __shared__ int data_mul_mat_q[];
     int * tile_y = data_mul_mat_q + J;
-    int * tile_x = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
+    int * tile_y2 = tile_y + (y_prefetch ? y_pad : 0);
+    int * tile_x = tile_y + y_pad + (y_prefetch ? y_pad : 0);
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
     // FP4 tile stores 8 blocks
@@ -1007,6 +1030,36 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+        if constexpr (y_prefetch) {
+            // fp8 fast path: stage BOTH K-halves of the y tile first, then expand the x tile.
+            // The y global reads overlap nothing on iteration k, but the x-tile expansion of
+            // iteration k+1 can be hoisted by the scheduler ahead of the two vec_dots, and the
+            // second vec_dot no longer waits on a load + barrier pair. Two barriers per
+            // K-iteration instead of four.
+            load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+            {
+                // blocks_per_iter ITER_K/qk == 2 y-blocks per iteration: stage block kb0/4 into
+                // tile_y and block kb0/4+1 into tile_y2, then run both K-halves without a
+                // reload + barrier pair between them.
+                const int * by0  = y + ncols_y * (kb0 * qk / ne_block) * sz;
+                const int * by1  = by0 + ncols_y * sz;
+#pragma unroll
+                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+
+                    tile_y[l]  = by0[l];
+                    tile_y2[l] = by1[l];
+                }
+            }
+
+            __syncthreads();
+
+            vec_dot(tile_x, tile_y, sum, 0);
+
+            vec_dot(tile_x, tile_y2, sum, MMQ_TILE_NE_K);
+
+            __syncthreads();
+        } else {
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
@@ -1039,6 +1092,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
 
         __syncthreads();
+        }
     }
 
     if (fixup) {
@@ -1486,11 +1540,14 @@ struct mmq_args {
     int64_t ncols_opt; // value to optimize the tile size against, launch grid still uses ncols_max
 };
 
+
+
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
     const size_t nbs_ids = config.J*sizeof(int);
     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
     const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
-    return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
+    const size_t nbs_y_all = ggml_cuda_mmq_y_prefetch(config.type, config.fallback, cc) ? 2*nbs_y : nbs_y;
+    return nbs_ids + nbs_x + GGML_PAD(nbs_y_all, config.nthreads*sizeof(int));
 }
 
 template <ggml_type type, int J, bool fallback>
@@ -1584,7 +1641,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
-    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+    for (int J = 8; J <= 256 && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
         if (config.type == GGML_TYPE_COUNT) {
             continue;
@@ -1650,6 +1707,12 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             break;
         case 128:
             launch_mul_mat_q<type, 128, fallback>(ctx, args, stream);
+            break;
+        case 192:
+            launch_mul_mat_q<type, 192, fallback>(ctx, args, stream);
+            break;
+        case 256:
+            launch_mul_mat_q<type, 256, fallback>(ctx, args, stream);
             break;
         default:
             fprintf(stderr, "J_best=%d\n", J_best);
