@@ -237,6 +237,34 @@ has to be quantized to the same scheme as the target.
 Everything else - `NVFP4`, the `Q4_0` family, the k-quants - still runs its existing path and is
 untuned here. The numbers above were all measured on `MXFP4`.
 
+### Upstream Q2_K register spill on RDNA4, fixed here
+
+The upstream MMQ config table (6eddde06a, "refactor MMQ kernel configuration") gives `Q2_K` a
+maximum tile of J=80 with a 128 deep tile on RDNA4, and that kernel does not fit: 256 VGPR and
+2128 bytes of scratch memory per thread. Every `Q2_K` GEMM therefore spills to local memory and
+runs at 2.9 TFLOP/s while every other quant type on the same model runs at 68 to 167 - on a
+mixed IQ3_S build of Qwen3.8-27B, 13 `Q2_K` tensors took 50% of one prefill pass. The
+`llama.cpp-ROCm` and `llama.cpp-W8A8` checkouts show the identical numbers, this is an upstream
+defect, not something introduced in this fork.
+
+`Q2_K` carries two auxiliary quantities per superblock where `Q3_K` carries one, which is why the
+128 deep tile does not fit. The fix adds half depth (I=64) tiles at J=96/112/128 and keeps the
+old entry as the J=80 fallback; the J picker takes the config with the fewest column tiles, so
+large batches now select J=128 with no spill at all. Measured on the same model, same session:
+
+| | before | after |
+|---|---|---|
+| `Q2_K` per forward pass (13 calls) | 1020.1 ms | 130.2 ms |
+| `Q2_K` throughput | 2.9 TFLOP/s | 23.1 TFLOP/s |
+| scratch memory | 2128 B/thread | 0 |
+| pp2048 | 820.3 | 1294.3 (+58%) |
+
+`MUL_MAT` passes 708/708. Perplexity is bit identical (tile width does not change the K order),
+and the MXFP4 radiance path does not dispatch `Q2_K` at all, so it is unaffected. The fix is
+present on all three branches of this fork (`master`, `Radiance`, `llama.cpp-Pascal`), and
+`Q2_K` still has headroom left - it now runs at 23 TFLOP/s against 68 for the slowest of its
+peers, the half depth tile does double work.
+
 ## RDNA4 I4 W4A4 (weight 4-bit x activation 4-bit)
 
 `Q4_0_ROCMI4` is a signed-nibble 4-bit format with a one-byte UE4M3 block scale
