@@ -112,6 +112,37 @@ f32 `y` and its e4m3 quantizate in one pass, and a device-side row hash lets a r
 skip requantizing byte-identical rows. The hash lives in device memory, so nothing here breaks
 graph capture.
 
+### Building
+
+**There is no flag to turn this on.** `radiance-gemm.cu` is picked up by the backend's
+`file(GLOB "../ggml-cuda/*.cu")`, the same way as every other kernel, and the source has no
+preprocessor guard around it. The only build-time requirement is that the target list contains
+an RDNA4 architecture:
+
+```bash
+cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1201 -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+`gfx1200` (RX 9060 XT) works too, and both can be listed together. **Do not put a non-RDNA4
+architecture in the same list.** The kernels call the gfx12-only builtin directly, so every
+target in `AMDGPU_TARGETS` has to compile the file, and a mixed list fails outright:
+
+```
+error: '__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12' needs target feature
+       wmma-128b-insts,wavefrontsize32
+```
+
+On a machine with both an RDNA4 and an older card, build for the RDNA4 targets only. A build
+made without an RDNA4 target does not compile at all, rather than compiling and falling back at
+runtime.
+
+At runtime the path is chosen per device: `ggml_cuda_radiance_supported()` reads the compute
+capability of the device the op is running on and requires it to be RDNA4, so on a multi-GPU
+setup only the RDNA4 devices take this path while the others keep their existing kernels. The
+env switches listed above apply on top of that, with `GGML_RAD_DISABLE=1` as the way to switch
+back to MMQ.
+
 ### Performance on Qwen3.8-27B, single R9700
 
 `-ub 2048`, `-fa 1`, greedy:
