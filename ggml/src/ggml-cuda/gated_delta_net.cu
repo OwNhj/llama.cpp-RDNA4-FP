@@ -291,6 +291,7 @@ __global__ void __launch_bounds__(256, 1) gdn_chunked_wmma_cuda(
     float  * s_g  = s_b + C;                             // C
     float  * s_c  = s_g + C;                             // C, running sum of g, never underflows
     float  * s_x  = (float *) s_q;                       // C x CP, scratch: dead q tile after q.S0
+    __shared__ float s_t16[16 * 16];                     // L21 X11, then overwritten by the fixup
 
     // ---- state -> accumulators. lane L of warp w holds h[16i + 8*(L/16) + j][16w + L%16].
     gdn_f32x8 st[KD / 16];
@@ -390,31 +391,67 @@ __global__ void __launch_bounds__(256, 1) gdn_chunked_wmma_cuda(
         // The sweep over column j needs M[i][m] while writing X[i][j], so M and X cannot share
         // storage: s_q is dead after q.S0 and serves as the second buffer.
         __syncthreads();
-        if (warp == 0) {
-            const int j = lane;
-#pragma unroll 1
-            for (int i = 0; i < C; ++i) {
-                const float gv = s_gr[i * CP + j];
-                s_gr[i * CP + j] = (i == j) ? 1.0f
-                                 : (j < i) ? s_b[i] * expf(s_c[i] - s_c[j]) * gv
-                                           : 0.0f;
+        for (int idx = tid; idx < C * C; idx += NTH) {
+            const int i = idx / C;
+            const int j = idx % C;
+            const float gv = s_gr[i * CP + j];
+            s_gr[i * CP + j] = (i == j) ? 1.0f
+                             : (j < i) ? s_b[i] * expf(s_c[i] - s_c[j]) * gv
+                                       : 0.0f;
+        }
+        __syncthreads();
+        if (warp < 2 && lane < 16) {
+            // The two 16x16 diagonal blocks are independent, so warps 0 and 1 invert them at the
+            // same time. Depth drops from 32 to 16 and column j stays in registers: lane j itself
+            // writes every element it reads.
+            const int off = warp * 16;
+            const int j   = lane;
+            float xr[16];
+#pragma unroll
+            for (int m = 0; m < 16; ++m) {
+                xr[m] = (m == j) ? 1.0f : 0.0f;
             }
-            __syncwarp();
-#pragma unroll 1
-            for (int i = 0; i < C; ++i) {
-                if (i < j) {
-                    s_x[i * CP + j] = 0.0f;
-                } else if (i == j) {
-                    s_x[i * CP + j] = 1.0f;
-                } else {
-                    float acc = 0.0f;
-#pragma unroll 1
-                    for (int m = j; m < i; ++m) {
-                        acc += s_gr[i * CP + m] * s_x[m * CP + j];
-                    }
-                    s_x[i * CP + j] = -acc;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                float acc = 0.0f;
+#pragma unroll
+                for (int m = 0; m < i; ++m) {
+                    acc += s_gr[(off + i) * CP + off + m] * xr[m];
+                }
+                if (i > j) {
+                    xr[i] = -acc;
                 }
             }
+#pragma unroll
+            for (int m = 0; m < 16; ++m) {
+                s_x[(off + m) * CP + off + j] = xr[m];
+            }
+        }
+        __syncthreads();
+        // X21 = -X22 L21 X11. One element per thread for each of the two 16x16 products.
+        // The top right block of the inverse stays zero, which M being block lower triangular
+        // already implies; s_inv is read as a whole tile, so it has to be written.
+        {
+            const int rr = tid >> 4;
+            const int cc = tid & 15;
+            s_x[rr * CP + 16 + cc] = 0.0f;
+            float acc = 0.0f;
+#pragma unroll
+            for (int m = 0; m < 16; ++m) {
+                acc += s_gr[(16 + rr) * CP + m] * s_x[m * CP + cc];
+            }
+            s_t16[rr * 16 + cc] = acc;
+        }
+        __syncthreads();
+        {
+            const int rr = tid >> 4;
+            const int cc = tid & 15;
+            float acc = 0.0f;
+#pragma unroll
+            for (int m = 0; m < 16; ++m) {
+                acc += s_x[(16 + rr) * CP + 16 + m] * s_t16[m * 16 + cc];
+            }
+            s_x[(16 + rr) * CP + cc] = -acc;
         }
         __syncthreads();
 
