@@ -149,9 +149,9 @@ back to MMQ.
 
 | test | t/s |
 |---|---|
-| pp512 | 2210 |
-| pp2048 | 2578 |
-| tg128 | 29.90 |
+| pp512 | 2290 |
+| pp2048 | 2692 |
+| tg128 | 29.85 |
 
 Prefill is the point of the whole exercise. Against the MMQ fp8 WMMA path - which issues the
 *same* `v_wmma_f32_16x16x16_fp8_fp8` on the *same* weights and differs only in how the kernel
@@ -164,12 +164,46 @@ quantization:
 | radiance off (`GGML_RAD_DISABLE=1`, MMQ fp8 WMMA) | 1518 | 1650 |
 | speedup | 1.45x | 1.54x |
 
-(This table and the one above come from separate runs; the pp2048 difference between them is
-inside the run-to-run spread.)
+That A/B was taken before the GDN and rms_norm work below, which is why its "radiance on" row
+reads lower than the table above. Both rows come from the same session and the same binary, so
+the ratio between them is what the comparison is for.
 
 Measured against the instruction's own ceiling on this card (329 TFLOP/s peak in a standalone
-microbenchmark), the radiance kernel sustains **262 TFLOP/s, about 80%** of what the fp8 WMMA
-can issue.
+microbenchmark), the radiance kernel sustains **252 TFLOP/s, about 77%** of what the fp8 WMMA
+can issue. Its inner loop is 198 instructions per 64 WMMAs, 3.1 instructions per WMMA, so the
+remaining gap is register pressure rather than address arithmetic.
+
+### GDN chunked prefill and the rms_norm block width
+
+Two further changes target the non-GEMM part of a prefill pass. Both are shape driven, so they
+apply to any model with this layer layout rather than to MXFP4 only.
+
+**The chunked GDN triangular inverse.** 48 of the 65 layers are gated delta net layers, and
+their chunked prefill kernel was dominated by one block: a 32x32 unit lower triangular inverse
+run by a single warp. Each lane wrote its own column of the inverse and then read every element
+back out of LDS on the next row, so every term of the inner sum paid two LDS reads plus a write,
+with `unroll 1` keeping the sweep rolled up. Holding the column in registers instead, splitting
+the 16x16 diagonal blocks across two warps, and doing the off-diagonal block as one 16x16
+product took the kernel from 23.8 to 10.3 us per chunk:
+
+| | per forward, 48 layers | pp2048 |
+|---|---|---|
+| before | 73.1 ms | 2550 |
+| after | 43.3 ms | 2668 |
+
+**The rms_norm block width.** `rms_norm_f32` walks its row with
+`for (col = tid; col < ncols; col += block_size)`, so a block wider than `ncols` leaves the
+extra threads idle while still joining `block_reduce` and every `__syncthreads`. Two of the
+three prefill instances run at `ncols = 128` with a 256 wide block, so half of each block was
+doing nothing. Adding an `ncols <= 128` arm that launches the same template with 128 threads cut
+the rms_norm total from 46.8 to 36.6 ms per forward pass, worth a further +1.1% at pp2048.
+
+Together the two are worth **+4.7% and +1.1% on pp2048**. On perplexity (`--chunks 8 -ub 2048`)
+the baseline is `6.9633 +/- 0.12494`; the GDN inverse takes it to `6.9517 +/- 0.12466`, a shift of
+0.17% that sits well inside the error bar, and the rms_norm change then leaves it bit identical.
+The register form of the inverse is exact, and only the blocked form moves anything: it reassociates
+the diagonal solves and differs from the old code by 7.5e-9 on 140 of 528 entries, which is six
+orders of magnitude below the bf16 resolution of the values that follow.
 
 ### DFlash speculative decode
 
