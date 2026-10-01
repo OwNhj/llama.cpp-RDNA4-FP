@@ -52,6 +52,125 @@
 > experimental **`MXFP4_E4M3`**, which keeps MXFP4's exact 17-byte block and replaces only the
 > E8M0 scale with a UE4M3. See [MXFP6 and MXFP4_E4M3](#mxfp6-and-mxfp4_e4m3) below.
 >
+> **MXFP4** weights also have a dedicated prefill path ported from DeadCode's vLLM fork,
+> [vllm-radiance](https://codeberg.org/StillDeadcode/vllm-radiance) and its `libr4d` kernels.
+> See [RDNA4 Radiance MXFP4 prefill](#rdna4-radiance-mxfp4-prefill) below.
+>
+
+## RDNA4 Radiance MXFP4 prefill
+
+The MXFP4 prefill GEMM is a port of [DeadCode's vllm-radiance](https://codeberg.org/StillDeadcode/vllm-radiance)
+and its [libr4d](https://codeberg.org/StillDeadcode/vllm-radiance) kernel library, which run
+vLLM on the R9700 (gfx1201 / RDNA4) through the fp8 WMMA tensor core. The idea it carries over is
+that MXFP4 weights do not need an FP4 tensor core, because every e2m1 magnitude is exactly
+representable in e4m3: expand the weights to e4m3 once and run the matmul on
+`v_wmma_f32_16x16x16_fp8_fp8`. The kernels here were re-derived against `ggml-cuda` rather than
+copied, since the upstream side is Triton/CUDA and this tree is C++/HIP, but the kernel
+organization is the part that was ported.
+
+### How it plugs in
+
+`ggml_cuda_mul_mat_q_radiance()` sits at the top of `ggml_cuda_mul_mat_q()` and takes the call
+over only when its policy accepts the shape: type is `MXFP4`, the device is RDNA4, `M` (tokens)
+`>= 256`, `K % 64 == 0`, `N % 16 == 0`, and all three operands are contiguous. Anything else
+falls through to the existing MMQ/MMVQ routing untouched, so no other type, batch size or
+backend changes behavior.
+
+Three env switches are useful while tuning:
+
+* `GGML_RAD_DISABLE=1` turns the path off, which is also how the A/B numbers below were taken.
+* `GGML_RAD_PREFILL_MIN_M` moves the token threshold (default 256).
+* `GGML_RAD_DEBUG=1` prints why a given shape was declined.
+
+Three pieces do the work.
+
+**1. One-time weight repack.** MXFP4 nibbles are not in an order the fp8 loader can consume, so
+on first sight of a weight tensor `ggml_cuda_radiance_repack()` rewrites it into an e4m3 tile
+layout: `W` is the packed e4m3 payload, `Ws` holds the E8M0 scales and `Wref` the reference
+scale byte. The repack is size-neutral - `N*K/2 + N*K/32 + N` bytes is exactly MXFP4's
+0.53125 B/weight - so it does not double the weight footprint, it only has to coexist with the
+original tensor. Results are cached per weight pointer for the process lifetime.
+
+The per-block exponent is folded into the weight at repack time, which is what removes the
+per-32-block rescale from the inner loop entirely. That fold has to descend into e4m3
+**subnormals** to stay exact: stopping at the smallest e4m3 normal makes it exact only while the
+exponent spread `d <= 5`, and this checkpoint reaches `d = 10` (`mlp.down_proj` holds 11354 of
+the model's 14433 out-of-range blocks). The truncated form zeroed 6.7% of the weights on 36
+output channels of layer 58, for per-channel errors up to 18.7%. With subnormals every affected
+layer with `d <= 8` is exact and layer 58 drops 4x to 0.31%.
+
+**2. The GEMM itself** (`radiance_mxfp4_fp8_gemm_atiled`). TM=4, WM=4, WN=2 (256 threads, 4
+waves), an N tile of 128, and `TN=4` once `M >= 2048` so the weight tile is amortized over more
+columns. The weight tile is staged through LDS, while the activations are read straight from
+global as A fragments and consumed only at the WMMAs. The inner loop comes out at 3.1
+instructions per WMMA, 32.5% of them the WMMA itself - reading the weight tile once and reusing
+it across the whole M tile is where the win over the generic MMQ comes from.
+
+**3. Fused swiglu + per-token fp8 quant.** The GLU output feeds one MXFP4 down GEMM, which
+would otherwise have to re-read `y` to quantize it. `swiglu_quant_fused_kernel` emits both the
+f32 `y` and its e4m3 quantizate in one pass, and a device-side row hash lets a repeated call
+skip requantizing byte-identical rows. The hash lives in device memory, so nothing here breaks
+graph capture.
+
+### Performance on Qwen3.8-27B, single R9700
+
+`-ub 2048`, `-fa 1`, greedy:
+
+| test | t/s |
+|---|---|
+| pp512 | 2210 |
+| pp2048 | 2578 |
+| tg128 | 29.90 |
+
+Prefill is the point of the whole exercise. Against the MMQ fp8 WMMA path - which issues the
+*same* `v_wmma_f32_16x16x16_fp8_fp8` on the *same* weights and differs only in how the kernel
+is organized - the switch is one env var, so the comparison isolates kernel organization from
+quantization:
+
+| | pp512 | pp2048 |
+|---|---|---|
+| radiance on | 2205 | 2549 |
+| radiance off (`GGML_RAD_DISABLE=1`, MMQ fp8 WMMA) | 1518 | 1650 |
+| speedup | 1.45x | 1.54x |
+
+(This table and the one above come from separate runs; the pp2048 difference between them is
+inside the run-to-run spread.)
+
+Measured against the instruction's own ceiling on this card (329 TFLOP/s peak in a standalone
+microbenchmark), the radiance kernel sustains **262 TFLOP/s, about 80%** of what the fp8 WMMA
+can issue.
+
+### DFlash speculative decode
+
+Generation is llama.cpp's weak side on this model, so the prefill work is paired with a DFlash
+drafter (`--spec-type draft-dflash --spec-draft-n-max 7 --temp 0`). The drafter proposes 7 tokens
+per forward and they are verified in one pass, which is worth roughly 1.8x over plain decode:
+`tg128` alone is 29.90 t/s, while the same card at `-ub 2048` with DFlash lands between 49 and
+86 t/s depending on how predictable the continuation is:
+
+| prompt | decoded | accepted |
+|---|---|---|
+| online softmax | 69.6 t/s | 231 / 488 |
+| Python merge | 86.2 t/s | 253 / 381 |
+| French Revolution | 49.1 t/s | 196 / 736 |
+
+That spread is inherent to speculative decoding - the accept rate tracks the text, not the
+kernel - so quote a range rather than a single number. The drafter is a separate small GGUF and
+has to be quantized to the same scheme as the target.
+
+### Supported quantization types
+
+**The tuned prefill paths in this fork currently cover three weight types only - `MXFP4`,
+`MXFP8` and `BF16`.** A model has to be quantized to one of them to benefit:
+
+| weight type | prefill path | notes |
+|---|---|---|
+| `MXFP4` | radiance, fp8 WMMA | the target of this work; engages at `M >= 256` |
+| `MXFP8` | MMQ, fp8 WMMA | same instruction, generic MMQ organization |
+| `BF16` | f16/bf16 WMMA (`mmf`) | unquantized baseline, already upstream |
+
+Everything else - `NVFP4`, the `Q4_0` family, the k-quants - still runs its existing path and is
+untuned here. The numbers above were all measured on `MXFP4`.
 
 ## RDNA4 I4 W4A4 (weight 4-bit x activation 4-bit)
 
@@ -399,6 +518,18 @@ through `calc_nwarps` / `calc_rows_per_block`. The loader, the byte-interleaved 
 packing, the LDS stride, the `vec_dot` and the per-tile configuration were all re-derived for
 that structure. RDNA4 also has the K = 32 form of the instruction, so a single
 `v_wmma_i32_16x16x32_iu4` is issued where ROCmFPX calls the K = 16 form twice.
+
+The MXFP4 prefill path is ported from DeadCode's
+[vllm-radiance](https://codeberg.org/StillDeadcode/vllm-radiance) and its `libr4d` kernel
+library, which bring vLLM up on the R9700 through the fp8 WMMA tensor core. That side is
+Triton/CUDA, so the kernels were re-derived against `ggml-cuda` rather than copied: what
+carried over is the organization - expand the e2m1 weights to e4m3 once at repack, fold the
+MX block exponent into the weight, then stage the weight tile through LDS while reading the
+activation straight from global as A fragments. The shape policy, the repack cache, the
+fused swiglu quantize and the integration into `ggml_cuda_mul_mat_q` are specific to this
+tree. The `radiance_mxfp4_fp8_gemm_folded` and `_decode` variants are also ported from
+libr4d, and the subnormal handling in the exponent fold was added here after measuring that
+the truncated form zeroed channels on layer 58.
 
 The ROCmFP4 / ROCmFPx family that the ROCmFPX port originally brought along (Q4_0_ROCMFP4,
 Q4_0_ROCMFP4_FAST, Q3_0/Q2_0/Q6_0/Q8_0_ROCMFPX) has been removed: none of it is used by the
