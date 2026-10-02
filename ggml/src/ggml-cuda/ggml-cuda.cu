@@ -741,6 +741,7 @@ struct ggml_backend_cuda_buffer_context {
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    ggml_cuda_invalidate_weight_caches(ctx->dev_ptr, buffer->size);
     delete ctx;
 }
 

@@ -1767,6 +1767,8 @@ extern DECL_MMQ_CASE(GGML_TYPE_MXFP4_E4M3);
 
 // -------------------------------------------------------------------------------------------------------------------------
 
+void ggml_cuda_invalidate_weight_caches(const void * base, size_t size);
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 

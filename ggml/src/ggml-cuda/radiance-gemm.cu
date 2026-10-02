@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include <hip/hip_runtime.h>
+#include <map>
 #include <hip/hip_bf16.h>
 #include <cstdint>
 #include <cstdio>
@@ -1962,11 +1963,27 @@ struct ggml_rad_act_buf {
     uint2 * hashes;
     int64_t M, K;
 };
-// one buffer set per K: hashes must never leak across tensors with different row widths
-static std::unordered_map<int64_t, ggml_rad_act_buf> ggml_rad_act_bufs;
+// one buffer set per (device, K): hashes must never leak across tensors with different row
+// widths, and on multi-GPU (tensor split) a K-keyed cache hands device 0's allocation to the
+// kernel running on device 1 -> illegal memory access. current device is set by the caller.
+static std::map<std::pair<int, int64_t>, ggml_rad_act_buf> ggml_rad_act_bufs;
 static ggml_rad_act_buf ggml_rad_act_get(int64_t M, int64_t K, cudaStream_t stream) {
-    auto it = ggml_rad_act_bufs.find(K);
+    const int dev = ggml_cuda_get_device();
+    auto key = std::make_pair(dev, K);
+    auto it = ggml_rad_act_bufs.find(key);
     if (it == ggml_rad_act_bufs.end() || it->second.M < M) {
+        // capture-safe: growing the scratch issues cudaMalloc/MemsetAsync, illegal in a capture.
+        // callers must treat the empty set as "decline" and fall back to the non-radiance path.
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) {
+            return { nullptr, nullptr, nullptr, 0, 0 };
+        }
+        if (it != ggml_rad_act_bufs.end()) {  // growing: release the old set on its own device
+            cudaFree(it->second.q);
+            cudaFree(it->second.scale);
+            cudaFree(it->second.hashes);
+            ggml_rad_act_bufs.erase(it);
+        }
         ggml_rad_act_buf b = {nullptr, nullptr, nullptr, 0, 0};
         const int64_t Mcap = std::max<int64_t>(M, 4096);
         cudaMalloc((void **)&b.q,   (size_t)((Mcap + 15) & ~15) * K);
@@ -1974,7 +1991,7 @@ static ggml_rad_act_buf ggml_rad_act_get(int64_t M, int64_t K, cudaStream_t stre
         cudaMalloc((void **)&b.hashes, (size_t)Mcap * sizeof(uint2));
         cudaMemsetAsync(b.hashes, 0xFF, (size_t)Mcap * sizeof(uint2), stream); // force first requant
         b.M = Mcap; b.K = K;
-        it = ggml_rad_act_bufs.emplace(K, b).first;
+        it = ggml_rad_act_bufs.emplace(key, b).first;
     }
     return it->second;
 }
@@ -1982,6 +1999,10 @@ static ggml_rad_act_buf ggml_rad_act_get(int64_t M, int64_t K, cudaStream_t stre
 void ggml_cuda_radiance_quantize_tokens(const float * x, int64_t sx, int64_t K, int64_t M,
                                         unsigned char ** q, float ** scale, cudaStream_t stream) {
     ggml_rad_act_buf b = ggml_rad_act_get(M, K, stream);
+    if (b.q == nullptr) {
+        *q = nullptr;   // declined under capture; caller falls back to MMQ
+        return;
+    }
     const dim3 grid(1, (unsigned) M);
     quantize_tokens_fp8<<<grid, 256, 0, stream>>>(x, sx, K, b.q, b.scale, b.hashes);
     *q = b.q; *scale = b.scale;

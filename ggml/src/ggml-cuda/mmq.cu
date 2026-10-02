@@ -118,6 +118,26 @@ static void ggml_cuda_free_radiance_weights() {
     g_radiance_weights.clear();
 }
 
+// the repack cache is keyed by the weight tensor's device pointer. when a model's CUDA buffer
+// is freed the keys become dangling: the next load may reuse the same address (stale repacked
+// weights) or a different one (leaked repacks -> OOM across reloads). drop every cache entry
+// whose key falls inside the freed range.
+void ggml_cuda_invalidate_weight_caches(const void * base, size_t size) {
+    const char * lo = (const char *) base;
+    const char * hi = lo + size;
+    for (auto it = g_radiance_weights.begin(); it != g_radiance_weights.end();) {
+        const char * k = (const char *) it->first;
+        if (k >= lo && k < hi) {
+            cudaFree(it->second.W);
+            cudaFree(it->second.Ws);
+            cudaFree(it->second.Wref);
+            it = g_radiance_weights.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 // radiance W8A8 fp8 WMMA prefill fast path for MXFP4 weights. returns true when handled.
 static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
                                          const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
@@ -160,6 +180,13 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
     const void * key = src0->data;
     auto it = g_radiance_weights.find(key);
     if (it == g_radiance_weights.end() || it->second.device != device) {
+        // capture-safe contract: repack allocates; a miss while the stream is capturing must
+        // fall through to MMQ instead of the illegal cudaMalloc inside the capture.
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) {
+            if (dbg) fprintf(stderr, "[rad] decline capture-miss K=%ld N=%ld M=%ld\n", (long)K, (long)N, (long)M);
+            return false;
+        }
         ggml_radiance_weight w;
         w.device = device;
         const size_t wq_bytes  = (size_t)N * K / 2;
@@ -180,6 +207,9 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
     if (!ggml_rad_fused_act_lookup(src1->data, K, (const unsigned char **) &q8, (const float **) &as)) {
         ggml_cuda_radiance_quantize_tokens((const float *) src1->data, src1->nb[1] / sizeof(float),
                                            K, M, &q8, &as, stream);
+        if (q8 == nullptr) {
+            return false;   // act scratch realloc declined under capture, fall back to MMQ
+        }
     }
 
     ggml_cuda_radiance_gemm_f32(q8, w.W, w.Ws, w.Wref, as,

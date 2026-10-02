@@ -142,6 +142,9 @@
 #define cudaGraphGetNodes hipGraphGetNodes
 #define cudaGraphExecUpdate hipGraphExecUpdate
 #define cudaStreamCaptureModeRelaxed hipStreamCaptureModeRelaxed
+#define cudaStreamIsCapturing hipStreamIsCapturing
+#define cudaStreamCaptureStatus hipStreamCaptureStatus
+#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
 #define cudaStreamBeginCapture hipStreamBeginCapture
 #define cudaGraph_t hipGraph_t
 #define cudaStream_t hipStream_t
